@@ -15,7 +15,43 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <driver/spi_common.h>
+#include "driver/ledc.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+static void InitAndTestServo() {
+    ledc_timer_config_t timer_conf = {
+        .speed_mode       = LEDC_LOW_SPEED_MODE,
+        .duty_resolution  = LEDC_TIMER_13_BIT,
+        .timer_num        = LEDC_TIMER_1,
+        .freq_hz          = 50,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer_conf);
+
+    ledc_channel_config_t channel_conf = {
+        .gpio_num   = SERVO_SIGNAL_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_1,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .timer_sel  = LEDC_TIMER_1,
+        .duty       = 614, // 初始90度居中
+        .hpoint     = 0
+    };
+    ledc_channel_config(&channel_conf);
+
+    // 开机自动测试：左转45度 -> 右转135度 -> 回中90度
+    auto set_angle = [](int angle) {
+        uint32_t duty = 205 + (angle * (1024 - 205)) / 180;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    };
+    set_angle(45);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    set_angle(135);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    set_angle(90);
+}
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
 #endif
@@ -148,7 +184,19 @@ public:
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
             GetBacklight()->RestoreBrightness();
         }
-        
+  InitAndTestServo(); 
+        // 新增：注册语音控制舵机工具（直接放在这里即可生效）
+        McpServer::GetInstance().AddTool("self.servo.set_angle",
+            "控制机器人头部舵机转动角度(0到180度)。当用户说往左看设为30，往右看设为150，点个头或居中设为90。",
+            PropertyList({
+                Property("angle", kPropertyTypeInteger, 0, 180)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                int angle = properties["angle"].value<int>();
+                SetServoAngle(angle);
+                return true;
+            });
+    }
     }
 
     virtual Led* GetLed() override {
