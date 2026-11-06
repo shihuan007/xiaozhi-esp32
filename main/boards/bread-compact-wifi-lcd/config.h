@@ -285,5 +285,6 @@
 
 // A MCP Test: Control a lamp
 #define LAMP_GPIO GPIO_NUM_18
-
+// 新增：MG90S 舵机信号引脚 (对应底板 ML307R 插座 TXD 孔)
+#define SERVO_SIGNAL_GPIO GPIO_NUM_17
 #endif // _BOARD_CONFIG_H_
