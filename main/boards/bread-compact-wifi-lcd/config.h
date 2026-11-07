@@ -270,7 +270,7 @@
 
 #ifdef CONFIG_LCD_CUSTOM
 #define DISPLAY_WIDTH   240
-#define DISPLAY_HEIGHT  320
+#define DISPLAY_HEIGHT  240
 #define DISPLAY_MIRROR_X false
 #define DISPLAY_MIRROR_Y false
 #define DISPLAY_SWAP_XY false
