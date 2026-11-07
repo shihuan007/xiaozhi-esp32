@@ -25,7 +25,13 @@ static void SetServoAngle(int angle) {
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
+static void SetServoAngle(int angle) {
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+    uint32_t duty = 205 + (angle * (1024 - 205)) / 180;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
 static void InitAndTestServo() {
     ledc_timer_config_t timer_conf = {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
