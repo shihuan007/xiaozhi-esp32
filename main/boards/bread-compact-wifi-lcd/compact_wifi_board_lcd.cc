@@ -1,7 +1,7 @@
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
 #include "display/lcd_display.h"
-#include "display/otto_emoji_display.h"
+#include "../otto-robot/otto_emoji_display.h"
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
