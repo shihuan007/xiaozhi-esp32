@@ -1,7 +1,6 @@
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
 #include "display/lcd_display.h"
-
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
@@ -9,13 +8,6 @@
 #include "mcp_server.h"
 #include "lamp_controller.h"
 #include "led/single_led.h"
-static void SetServoAngle(int angle) {
-    if (angle < 0) angle = 0;
-    if (angle > 180) angle = 180;
-    uint32_t duty = 205 + (angle * (1024 - 205)) / 180;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-}
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_vendor.h>
