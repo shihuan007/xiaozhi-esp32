@@ -16,22 +16,18 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 2. 注入中文字幕、大表情与语音唤醒配置
+      - name: 2. 注入板型、16MB闪存、语音唤醒与大表情配置
         run: |
-          cat << 'EOF' >> sdkconfig.defaults
+          rm -f sdkconfig
+          cat << 'EOF' >> sdkconfig.defaults.esp32s3
           CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD=y
           CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
           CONFIG_PARTITION_TABLE_CUSTOM=y
           CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
-          CONFIG_SPIRAM=y
-          CONFIG_SPIRAM_MODE_OCT=y
-          CONFIG_SPIRAM_SPEED_80M=y
           CONFIG_USE_WAKE_WORD_DETECT=y
           CONFIG_USE_AUDIO_PROCESSOR=y
           CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
           CONFIG_LANGUAGE_ZH_CN=y
-          CONFIG_LCD_CUSTOM_EMOTE_OPS=y
-          CONFIG_OTTO_EMOJI_GIF=y
           CONFIG_EMOJI_FONT_64=y
           EOF
           idf.py set-target esp32s3
