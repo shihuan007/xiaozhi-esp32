@@ -16,29 +16,33 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 2. 注入板型、16MB闪存、语音唤醒与大表情配置
+      - name: 2. 激活 ESP-IDF 环境并编译打包固件
+        shell: bash
         run: |
+          # 关键修复：先激活 ESP-IDF 环境变量，解决 idf.py: not found 报错
+          source /opt/esp/idf/export.sh
+
+          # 清理旧配置并注入 1.54寸 LCD 板型、16MB 闪存、语音唤醒与中文字幕大表情
           rm -f sdkconfig
           cat << 'EOF' >> sdkconfig.defaults.esp32s3
           CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD=y
           CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
-          CONFIG_PARTITION_TABLE_CUSTOM=y
-          CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v2/16m.csv"
           CONFIG_USE_WAKE_WORD_DETECT=y
           CONFIG_USE_AUDIO_PROCESSOR=y
           CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
           CONFIG_LANGUAGE_ZH_CN=y
           CONFIG_EMOJI_FONT_64=y
           EOF
-          idf.py set-target esp32s3
 
-      - name: 3. 编译并打包成单一 merged-binary.bin
-        run: |
+          # 设置芯片并开始编译
+          idf.py set-target esp32s3
           idf.py build
+
+          # 将字库、唤醒模型与程序合并打包成单一 merged-binary.bin
           cd build
           esptool.py --chip esp32s3 merge_bin -o merged-binary.bin @flash_args
 
-      - name: 4. 上传生成的 .bin 固件供你下载
+      - name: 3. 上传生成的 .bin 固件供你下载
         uses: actions/upload-artifact@v4
         with:
           name: xiaozhi-servo-firmware
