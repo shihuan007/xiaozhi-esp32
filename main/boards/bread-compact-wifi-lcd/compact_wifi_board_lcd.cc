@@ -17,13 +17,82 @@
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-static void SetServoAngle(int angle) {
+// === 四路舵机引脚与通道定义（对应底板左下角 14, 13, 12, 11 引脚） ===
+#define SERVO_HEAD_LR_PIN     GPIO_NUM_14  // 头部左右摇头
+#define SERVO_HEAD_UD_PIN     GPIO_NUM_13  // 头部上下点头
+#define SERVO_LEFT_HAND_PIN   GPIO_NUM_12  // 左手挥臂
+#define SERVO_RIGHT_HAND_PIN  GPIO_NUM_11  // 右手挥臂
+
+#define SERVO_CH_HEAD_LR      LEDC_CHANNEL_1
+#define SERVO_CH_HEAD_UD      LEDC_CHANNEL_2
+#define SERVO_CH_LEFT_HAND    LEDC_CHANNEL_3
+#define SERVO_CH_RIGHT_HAND   LEDC_CHANNEL_4
+
+// 控制指定通道的舵机转动到 angle (0~180度)
+static void SetSingleServoAngle(ledc_channel_t channel, int angle) {
     if (angle < 0) angle = 0;
     if (angle > 180) angle = 180;
     uint32_t duty = 205 + (angle * (1024 - 205)) / 180;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
 }
+
+// 执行预设连贯动作：1=点头, 2=摇头, 3=左手挥手, 4=右手挥手, 5=双手欢呼
+static void RunServoAction(int action_type) {
+    switch (action_type) {
+        case 1: // 点头两次
+            for (int i = 0; i < 2; i++) {
+                SetSingleServoAngle(SERVO_CH_HEAD_UD, 55);
+                vTaskDelay(pdMS_TO_TICKS(250));
+                SetSingleServoAngle(SERVO_CH_HEAD_UD, 115);
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
+            SetSingleServoAngle(SERVO_CH_HEAD_UD, 90);
+            break;
+        case 2: // 左右摇头
+            SetSingleServoAngle(SERVO_CH_HEAD_LR, 45);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            SetSingleServoAngle(SERVO_CH_HEAD_LR, 135);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            SetSingleServoAngle(SERVO_CH_HEAD_LR, 90);
+            break;
+        case 3: // 举左手挥一挥
+            for (int i = 0; i < 2; i++) {
+                SetSingleServoAngle(SERVO_CH_LEFT_HAND, 150);
+                vTaskDelay(pdMS_TO_TICKS(250));
+                SetSingleServoAngle(SERVO_CH_LEFT_HAND, 100);
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
+            SetSingleServoAngle(SERVO_CH_LEFT_HAND, 90);
+            break;
+        case 4: // 举右手挥一挥
+            for (int i = 0; i < 2; i++) {
+                SetSingleServoAngle(SERVO_CH_RIGHT_HAND, 30);
+                vTaskDelay(pdMS_TO_TICKS(250));
+                SetSingleServoAngle(SERVO_CH_RIGHT_HAND, 80);
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
+            SetSingleServoAngle(SERVO_CH_RIGHT_HAND, 90);
+            break;
+        case 5: // 双手同时举起欢呼并点头
+            SetSingleServoAngle(SERVO_CH_LEFT_HAND, 150);
+            SetSingleServoAngle(SERVO_CH_RIGHT_HAND, 30);
+            SetSingleServoAngle(SERVO_CH_HEAD_UD, 60);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            SetSingleServoAngle(SERVO_CH_LEFT_HAND, 90);
+            SetSingleServoAngle(SERVO_CH_RIGHT_HAND, 90);
+            SetSingleServoAngle(SERVO_CH_HEAD_UD, 90);
+            break;
+        default: // 全部归中 90 度
+            SetSingleServoAngle(SERVO_CH_HEAD_LR, 90);
+            SetSingleServoAngle(SERVO_CH_HEAD_UD, 90);
+            SetSingleServoAngle(SERVO_CH_LEFT_HAND, 90);
+            SetSingleServoAngle(SERVO_CH_RIGHT_HAND, 90);
+            break;
+    }
+}
+
+// 初始化四台舵机并分步归中自检（错峰上电防止电流过大重启）
 static void InitAndTestServo() {
     ledc_timer_config_t timer_conf = {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
@@ -34,28 +103,34 @@ static void InitAndTestServo() {
     };
     ledc_timer_config(&timer_conf);
 
-    ledc_channel_config_t channel_conf = {
-        .gpio_num   = SERVO_SIGNAL_GPIO,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = LEDC_CHANNEL_1,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .timer_sel  = LEDC_TIMER_1,
-        .duty       = 614, // 初始90度居中
-        .hpoint     = 0
+    const gpio_num_t pins[4] = {
+        SERVO_HEAD_LR_PIN, SERVO_HEAD_UD_PIN, SERVO_LEFT_HAND_PIN, SERVO_RIGHT_HAND_PIN
     };
-    ledc_channel_config(&channel_conf);
+    const ledc_channel_t channels[4] = {
+        SERVO_CH_HEAD_LR, SERVO_CH_HEAD_UD, SERVO_CH_LEFT_HAND, SERVO_CH_RIGHT_HAND
+    };
 
-    // 开机自动测试：左转45度 -> 右转135度 -> 回中90度
-    auto set_angle = [](int angle) {
-        uint32_t duty = 205 + (angle * (1024 - 205)) / 180;
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-    };
-    set_angle(45);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    set_angle(135);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    set_angle(90);
+    for (int i = 0; i < 4; i++) {
+        ledc_channel_config_t ch_conf = {
+            .gpio_num   = pins[i],
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel    = channels[i],
+            .intr_type  = LEDC_INTR_DISABLE,
+            .timer_sel  = LEDC_TIMER_1,
+            .duty       = 614, // 90度中心位置
+            .hpoint     = 0
+        };
+        ledc_channel_config(&ch_conf);
+        SetSingleServoAngle(channels[i], 90);
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    // 开机轻轻摇头自检一次
+    SetSingleServoAngle(SERVO_CH_HEAD_LR, 70);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    SetSingleServoAngle(SERVO_CH_HEAD_LR, 110);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    SetSingleServoAngle(SERVO_CH_HEAD_LR, 90);
 }
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
@@ -189,16 +264,40 @@ public:
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
             GetBacklight()->RestoreBrightness();
         }
-  InitAndTestServo(); 
-        // 新增：注册语音控制舵机工具（直接放在这里即可生效）
-        McpServer::GetInstance().AddTool("self.servo.set_angle",
-            "控制机器人头部舵机转动角度(0到180度)。当用户说往左看设为30，往右看设为150，点个头或居中设为90。",
+  // 1. 初始化四路舵机并全部归中到 90 度
+        InitAndTestServo();
+
+        // 2. 注册四路舵机精确角度控制工具
+        McpServer::GetInstance().AddTool("self.servo.set_angles",
+            "同时控制机器人的四台舵机角度(0到180度，90为默认中心)。"
+            "参数说明：head_lr为头部左右(30左看,150右看,90居中)；"
+            "head_ud为头部上下(55低头,125抬头,90平视)；"
+            "left_hand为左手(150举起,90放下)；"
+            "right_hand为右手(30举起,90放下)。未提及的部位请传入90。",
             PropertyList({
-                Property("angle", kPropertyTypeInteger, 0, 180)
+                Property("head_lr", kPropertyTypeInteger, 0, 180),
+                Property("head_ud", kPropertyTypeInteger, 0, 180),
+                Property("left_hand", kPropertyTypeInteger, 0, 180),
+                Property("right_hand", kPropertyTypeInteger, 0, 180)
             }),
             [](const PropertyList& properties) -> ReturnValue {
-                int angle = properties["angle"].value<int>();
-                SetServoAngle(angle);
+                SetSingleServoAngle(SERVO_CH_HEAD_LR, properties["head_lr"].value<int>());
+                SetSingleServoAngle(SERVO_CH_HEAD_UD, properties["head_ud"].value<int>());
+                SetSingleServoAngle(SERVO_CH_LEFT_HAND, properties["left_hand"].value<int>());
+                SetSingleServoAngle(SERVO_CH_RIGHT_HAND, properties["right_hand"].value<int>());
+                return true;
+            });
+
+        // 3. 注册预设连贯动作工具（点头、摇头、挥手、欢呼）
+        McpServer::GetInstance().AddTool("self.servo.do_action",
+            "控制机器人做出连贯肢体动作。action_type取值："
+            "1=点头，2=摇头，3=举左手挥手，4=举右手挥手，5=双手欢呼，0=全部立正归位。",
+            PropertyList({
+                Property("action_type", kPropertyTypeInteger, 0, 5)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                int action_type = properties["action_type"].value<int>();
+                RunServoAction(action_type);
                 return true;
             });
     }
