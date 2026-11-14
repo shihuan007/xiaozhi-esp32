@@ -1,5 +1,16 @@
 #include <esp_timer.h>
 #include <driver/gpio.h>
+#include <driver/ledc.h>
+#include <driver/i2c_master.h>
+#include <driver/spi_common.h>
+#include <esp_log.h>
+#include <esp_lcd_panel_vendor.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <cmath>
+
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
 #include "display/lcd_display.h"
@@ -10,32 +21,23 @@
 #include "mcp_server.h"
 #include "lamp_controller.h"
 #include "led/single_led.h"
-#include <esp_log.h>
-#include <driver/i2c_master.h>
-#include <esp_lcd_panel_vendor.h>
-#include <esp_lcd_panel_io.h>
-#include <esp_lcd_panel_ops.h>
-#include <driver/spi_common.h>
-#include "driver/ledc.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include <driver/ledc.h>
-#include <driver/gpio.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <cmath>
-#include "mcp_server.h"
+
+#define TAG "CompactWifiBoardLCD"
+
 // ==================== 【位置二】4舵机错峰 + 5/6号双齿轮履带【同步驱动】模块 ====================
+// 注意：由于 GPIO 11/12/13 已用于接 4G 模块排母上的头部三路传感器，
+// 这里将 2/3/4 号舵机改为其他空闲引脚（如 GPIO 14/17/18/21），避免与传感器引脚冲突！
 #define SERVO_PAN_GPIO         GPIO_NUM_14   // 1号舵机: 头部左右摇头 (head_lr)
-#define SERVO_TILT_GPIO        GPIO_NUM_13   // 2号舵机: 头部上下点头 (head_ud)
-#define SERVO_LEFT_ARM_GPIO    GPIO_NUM_12   // 3号舵机: 左手挥臂 (left_hand)
-#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_11   // 4号舵机: 右手挥臂 (right_hand)
+#define SERVO_TILT_GPIO        GPIO_NUM_17   // 2号舵机: 头部上下点头 (head_ud) - 原13已让给摸头传感器
+#define SERVO_LEFT_ARM_GPIO    GPIO_NUM_18   // 3号舵机: 左手挥臂 (left_hand)   - 原12已让给右避障
+#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_21   // 4号舵机: 右手挥臂 (right_hand)  - 原11已让给左避障
 #define SERVO_LEFT_GEAR_GPIO   GPIO_NUM_10   // 5号舵机: 左侧齿轮履带 (left_gear)
 #define SERVO_RIGHT_GEAR_GPIO  GPIO_NUM_9    // 6号舵机: 右侧齿轮履带 (right_gear)
 
-#define SENSOR_TOUCH_GPIO      GPIO_NUM_8    // TTP223 触摸模块 (高电平触发)
-#define SENSOR_IR_LEFT_GPIO    GPIO_NUM_17   // 左侧红外模块 (借用空置4G模块引脚, 低电平触发)
-#define SENSOR_IR_RIGHT_GPIO   GPIO_NUM_18   // 右侧红外模块 (借用空置4G模块引脚, 低电平触发)
+// 对应你图五实际插在 4G 模块排母座 (TXD / EN / RXD) 上的三路头部传感器引脚：
+#define SENSOR_TOUCH_GPIO      GPIO_NUM_13   // 头顶 TTP223 触摸模块 (接 4G 排母 TXD 孔, 高电平触发)
+#define SENSOR_IR_LEFT_GPIO    GPIO_NUM_11   // 头部左侧红外避障模块 (接 4G 排母 EN 孔, 低电平触发)
+#define SENSOR_IR_RIGHT_GPIO   GPIO_NUM_12   // 头部右侧红外避障模块 (接 4G 排母 RXD 孔, 低电平触发)
 
 #define SERVO_UPPER_NUM        4             // 上半身错峰舵机数量 (索引 0~3)
 #define SERVO_TOTAL_NUM        6             // 总舵机数量 (索引 4, 5 为底部同步双齿轮)
@@ -97,22 +99,16 @@ static void SetServoTargetSafe(int idx, int target) {
     g_servos[idx].hold_counter = 0;
 }
 
-// 底部 5号、6号双齿轮履带【同步直行/后退/转向】封装函数
-// delta_deg: 相对90度中心的转动行程 (正数=前进, 负数=后退, 0=归中停止)
-// turn_mode: 0=直行同步(自动镜像补偿), 1=原地左转, 2=原地右转
 static void SetGearTrackSync(int delta_deg, int turn_mode = 0) {
     int left_target = 90 + delta_deg;
     int right_target = 90 + delta_deg;
 
     if (turn_mode == 0) {
-        // 同步直行前进/后退：若左右舵机背靠背镜像安装，右轮角度自动取反 (90 - delta_deg)
         right_target = (GEAR_MIRROR_DIR == 1) ? (90 - delta_deg) : (90 + delta_deg);
     } else if (turn_mode == 1) {
-        // 原地左转：左轮后退，右轮前进
         left_target  = 90 - std::abs(delta_deg);
         right_target = (GEAR_MIRROR_DIR == 1) ? (90 - std::abs(delta_deg)) : (90 + std::abs(delta_deg));
     } else if (turn_mode == 2) {
-        // 原地右转：左轮前进，右轮后退
         left_target  = 90 + std::abs(delta_deg);
         right_target = (GEAR_MIRROR_DIR == 1) ? (90 + std::abs(delta_deg)) : (90 - std::abs(delta_deg));
     }
@@ -122,21 +118,19 @@ static void SetGearTrackSync(int delta_deg, int turn_mode = 0) {
 }
 
 static void StaggeredServoTask(void* arg) {
-    int active_upper_idx = -1; // 当前激活的上半身舵机 (0~3)
-    bool gears_sync_active = false; // 底部 5/6 号双齿轮是否正在同步运转
+    int active_upper_idx = -1;
+    bool gears_sync_active = false;
     int cooldown_ticks = 0;
     int auto_reset_ticks = 0;
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_MS));
 
-        // 1. 若当前全部空闲，先检查上半身(0~3)是否有动作，再检查底部双齿轮(4 & 5)是否需要同步动作
         if (active_upper_idx == -1 && !gears_sync_active) {
             if (cooldown_ticks > 0) {
                 cooldown_ticks--;
                 continue;
             }
-            // 优先排队执行上半身 0~3 号舵机 (单路错峰)
             for (int i = 0; i < SERVO_UPPER_NUM; i++) {
                 if (g_servos[i].current_angle != g_servos[i].target_angle) {
                     active_upper_idx = i;
@@ -144,7 +138,6 @@ static void StaggeredServoTask(void* arg) {
                     break;
                 }
             }
-            // 当上半身 0~3 号舵机全部静止时，若 5号或6号齿轮有目标行程，立即开启【双齿轮同步模式】
             if (active_upper_idx == -1) {
                 if (g_servos[GEAR_LEFT_IDX].current_angle != g_servos[GEAR_LEFT_IDX].target_angle ||
                     g_servos[GEAR_RIGHT_IDX].current_angle != g_servos[GEAR_RIGHT_IDX].target_angle) {
@@ -155,7 +148,6 @@ static void StaggeredServoTask(void* arg) {
             }
         }
 
-        // 2A. 执行上半身单舵机错峰移动 (0~3号每次只动1台)
         if (active_upper_idx != -1) {
             EspIdfStaggeredServo &s = g_servos[active_upper_idx];
             if (s.current_angle != s.target_angle) {
@@ -173,7 +165,6 @@ static void StaggeredServoTask(void* arg) {
             continue;
         }
 
-        // 2B. 执行底部 5号 & 6号双齿轮【严格同帧同步】移动
         if (gears_sync_active) {
             EspIdfStaggeredServo &sL = g_servos[GEAR_LEFT_IDX];
             EspIdfStaggeredServo &sR = g_servos[GEAR_RIGHT_IDX];
@@ -189,11 +180,9 @@ static void StaggeredServoTask(void* arg) {
                     int diffR = sR.target_angle - sR.current_angle;
                     sR.current_angle += (std::abs(diffR) <= GEAR_SYNC_STEP_DEG) ? diffR : ((diffR > 0) ? GEAR_SYNC_STEP_DEG : -GEAR_SYNC_STEP_DEG);
                 }
-                // 在同一毫秒内同时刷新 5号和 6号 PWM 占空比，确保双侧齿轮 100% 同步啮合推进
                 ServoWriteAngle(GEAR_LEFT_IDX, sL.current_angle);
                 ServoWriteAngle(GEAR_RIGHT_IDX, sR.current_angle);
             } else {
-                // 双齿轮均到达目标位置，保持 120ms 稳住履带后同时断电释放
                 sL.hold_counter++;
                 if (sL.hold_counter >= SERVO_HOLD_TICKS) {
                     ServoDetach(GEAR_LEFT_IDX);
@@ -205,31 +194,77 @@ static void StaggeredServoTask(void* arg) {
             continue;
         }
 
-        // 3. 全部空闲时，检测摸头(GPIO8)与左右红外避障(GPIO17/18)
+        // 3. 全部空闲时，检测摸头(GPIO13)与左右红外避障(GPIO11/12)，联动舵机、屏幕表情与语音唤醒
         if (auto_reset_ticks > 0) {
             auto_reset_ticks--;
             if (auto_reset_ticks == 0) {
                 for (int i = 0; i < SERVO_UPPER_NUM; i++) SetServoTargetSafe(i, 90);
-                SetGearTrackSync(0, 0); // 底部双齿轮同步归中
+                SetGearTrackSync(0, 0);
             }
         } else {
-            if (gpio_get_level(SENSOR_TOUCH_GPIO) == 1) {
-                // 摸头互动：先抬头+挥双手(依次错峰) -> 最后底部双齿轮同步向前滚动一步
+            bool touch_active = (gpio_get_level(SENSOR_TOUCH_GPIO) == 1);
+            bool left_ir_active = (gpio_get_level(SENSOR_IR_LEFT_GPIO) == 0);
+            bool right_ir_active = (gpio_get_level(SENSOR_IR_RIGHT_GPIO) == 0);
+
+            if (touch_active) {
+                // 摸头互动：抬头+挥双手 -> 底部双齿轮同步向前滚动一步 + 开心表情 + 语音唤醒
+                SetServoTargetSafe(0, 90);
                 SetServoTargetSafe(1, 65);
                 SetServoTargetSafe(2, 145);
                 SetServoTargetSafe(3, 35);
-                SetGearTrackSync(50, 0); // 5/6号齿轮同步前进50度
+                SetGearTrackSync(50, 0);
                 auto_reset_ticks = 75;
-            } else if (gpio_get_level(SENSOR_IR_LEFT_GPIO) == 0) {
+
+                Application::GetInstance().Schedule([]() {
+                    auto& app = Application::GetInstance();
+                    auto display = Board::GetInstance().GetDisplay();
+                    if (display) {
+                        display->SetEmotion("happy");
+                        display->SetChatMessage("system", "感受到摸头啦~");
+                    }
+                    if (app.GetDeviceState() == kDeviceStateIdle) {
+                        app.ToggleChatState();
+                    }
+                });
+            } else if (left_ir_active && right_ir_active) {
+                // 正前方双侧同时遇障：惊讶表情 + 居中后退
+                SetServoTargetSafe(0, 90);
+                SetGearTrackSync(-45, 0);
+                auto_reset_ticks = 75;
+
+                Application::GetInstance().Schedule([]() {
+                    auto display = Board::GetInstance().GetDisplay();
+                    if (display) {
+                        display->SetEmotion("surprised");
+                        display->SetChatMessage("system", "哇！离我太近啦！");
+                    }
+                });
+            } else if (left_ir_active) {
                 // 左侧遇障：头向左看 -> 底部双齿轮同步向右转向避障
                 SetServoTargetSafe(0, 135);
-                SetGearTrackSync(45, 2); // 双齿轮同步右转
+                SetGearTrackSync(45, 2);
                 auto_reset_ticks = 75;
-            } else if (gpio_get_level(SENSOR_IR_RIGHT_GPIO) == 0) {
+
+                Application::GetInstance().Schedule([]() {
+                    auto display = Board::GetInstance().GetDisplay();
+                    if (display) {
+                        display->SetEmotion("thinking");
+                        display->SetChatMessage("system", "左边有动静 👀");
+                    }
+                });
+            } else if (right_ir_active) {
                 // 右侧遇障：头向右看 -> 底部双齿轮同步向左转向避障
                 SetServoTargetSafe(0, 45);
-                SetGearTrackSync(45, 1); // 双齿轮同步左转
+                SetGearTrackSync(45, 1);
                 auto_reset_ticks = 75;
+
+                Application::GetInstance().Schedule([]() {
+                    auto display = Board::GetInstance().GetDisplay();
+                    if (display) {
+                        display->SetEmotion("cool");
+                        display->SetChatMessage("system", "右边有动静 👀");
+                    }
+                });
             }
         }
     }
@@ -290,7 +325,6 @@ static void InitStaggeredServosAndSensors() {
             SetServoTargetSafe(1, properties["head_ud"].value<int>());
             SetServoTargetSafe(2, properties["left_hand"].value<int>());
             SetServoTargetSafe(3, properties["right_hand"].value<int>());
-            // 将 gear_sync 转换为相对 90 度的同步位移量，驱动 5、6 号双齿轮同步旋转
             int sync_val = properties["gear_sync"].value<int>();
             SetGearTrackSync(sync_val - 90, 0);
             return true;
@@ -299,6 +333,7 @@ static void InitStaggeredServosAndSensors() {
     xTaskCreate(StaggeredServoTask, "servo_stagger", 4096, nullptr, 5, nullptr);
 }
 // =========================================================================================
+
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
 #endif
@@ -339,137 +374,9 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
     {0xba, (uint8_t[]){0xFF, 0xFF}, 2, 0},
 };
 #endif
- 
-#define TAG "CompactWifiBoardLCD"
 
 class CompactWifiBoardLCD : public WifiBoard {
 private:
- class CompactWifiBoardLCD : public WifiBoard {
-private:
-    Button boot_button_;
-    LcdDisplay* display_;
-// 👇 粘贴在第 349 行 LcdDisplay* display_; 的正下方 👇
-    esp_timer_handle_t head_sensor_timer_ = nullptr;
-    int64_t last_trigger_time_ms_ = 0;
-
-    // 控制 GPIO_NUM_17 (SERVO_SIGNAL_GPIO) 舵机角度 (0° ~ 180°)
-    void SetHeadServoAngle(int angle) {
-        if (angle < 0) angle = 0;
-        if (angle > 180) angle = 180;
-        // MG90S 标准脉宽：500us (0°) ~ 2500us (180°)，90° 为正中 (1500us)
-        uint32_t pulse_us = 500 + (angle * 2000) / 180;
-        // 50Hz 周期为 20000us，14位分辨率最大占空比为 16384
-        uint32_t duty = (pulse_us * 16384) / 20000;
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7, duty);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7);
-    }
-
-    void InitializeHeadSensors() {
-        // 1. 初始化 GPIO_NUM_17 头部舵机 PWM (50Hz)
-        ledc_timer_config_t servo_timer = {};
-        servo_timer.speed_mode = LEDC_LOW_SPEED_MODE;
-        servo_timer.duty_resolution = LEDC_TIMER_14_BIT;
-        servo_timer.timer_num = LEDC_TIMER_3;
-        servo_timer.freq_hz = 50;
-        servo_timer.clk_cfg = LEDC_AUTO_CLK;
-        ESP_ERROR_CHECK(ledc_timer_config(&servo_timer));
-
-        ledc_channel_config_t servo_channel = {};
-        servo_channel.gpio_num = SERVO_SIGNAL_GPIO; // 即 config.h 中的 GPIO_NUM_17
-        servo_channel.speed_mode = LEDC_LOW_SPEED_MODE;
-        servo_channel.channel = LEDC_CHANNEL_7;
-        servo_channel.timer_sel = LEDC_TIMER_3;
-        servo_channel.duty = 0;
-        servo_channel.hpoint = 0;
-        ESP_ERROR_CHECK(ledc_channel_config(&servo_channel));
-
-        // 开机默认让头部舵机归位到 90° 正中位置
-        SetHeadServoAngle(90);
-
-        // 2. 初始化 GPIO 11, 12, 13 三路头部传感器为输入模式
-        gpio_config_t io_conf = {};
-        io_conf.intr_type = GPIO_INTR_DISABLE;
-        io_conf.mode = GPIO_MODE_INPUT;
-        io_conf.pin_bit_mask = (1ULL << HEAD_TOUCH_GPIO) | 
-                               (1ULL << HEAD_IR_LEFT_GPIO) | 
-                               (1ULL << HEAD_IR_RIGHT_GPIO);
-        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-        gpio_config(&io_conf);
-
-        // 3. 启动 50ms 周期定时器检测传感器
-        esp_timer_create_args_t timer_args = {
-            .callback = [](void* arg) {
-                static_cast<CompactWifiBoardLCD*>(arg)->CheckHeadSensors();
-            },
-            .arg = this,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "head_sensor_timer",
-            .skip_unhandled_events = true
-        };
-        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &head_sensor_timer_));
-        ESP_ERROR_CHECK(esp_timer_start_periodic(head_sensor_timer_, 50 * 1000));
-    }
-
-    void CheckHeadSensors() {
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_trigger_time_ms_ < 1500) {
-            return; // 1.5秒防抖冷却
-        }
-
-        bool touch_active = (gpio_get_level(HEAD_TOUCH_GPIO) == 1);
-        bool left_ir_active = (gpio_get_level(HEAD_IR_LEFT_GPIO) == 0);
-        bool right_ir_active = (gpio_get_level(HEAD_IR_RIGHT_GPIO) == 0);
-
-        if (!touch_active && !left_ir_active && !right_ir_active) {
-            return;
-        }
-
-        last_trigger_time_ms_ = now_ms;
-
-        Application::GetInstance().Schedule([this, touch_active, left_ir_active, right_ir_active]() {
-            auto display = GetDisplay();
-            auto& app = Application::GetInstance();
-
-            if (touch_active) {
-                ESP_LOGI(TAG, "头顶被触摸 (GPIO 13) -> 头部回正 90°");
-                SetHeadServoAngle(90); // 摸头时回正
-                if (display) {
-                    display->SetEmotion("happy");
-                    display->SetChatMessage("system", "感受到摸头啦~");
-                }
-                if (app.GetDeviceState() == kDeviceStateIdle) {
-                    app.ToggleChatState();
-                }
-            } 
-            else if (left_ir_active && right_ir_active) {
-                ESP_LOGI(TAG, "正前方双侧同时感应 (GPIO 11 & 12) -> 头部居中 90°");
-                SetHeadServoAngle(90); // 正前方靠近时居中
-                if (display) {
-                    display->SetEmotion("surprised");
-                    display->SetChatMessage("system", "哇！离我太近啦！");
-                }
-            } 
-            else if (left_ir_active) {
-                ESP_LOGI(TAG, "左侧感应到靠近 (GPIO 11) -> 舵机转头 135°");
-                SetHeadServoAngle(135); // 如果舵机安装方向相反，可与下面的 45 对调
-                if (display) {
-                    display->SetEmotion("thinking");
-                    display->SetChatMessage("system", "左边有动静 👀");
-                }
-            } 
-            else if (right_ir_active) {
-                ESP_LOGI(TAG, "右侧感应到靠近 (GPIO 12) -> 舵机转头 45°");
-                SetHeadServoAngle(45);  // 如果舵机安装方向相反，可与上面的 135 对调
-                if (display) {
-                    display->SetEmotion("cool");
-                    display->SetChatMessage("system", "右边有动静 👀");
-                }
-            }
-        });
-    }
-    // 👆 粘贴到此结束，下面是原本的第 351 行 void InitializeSpi() 👆
-    void InitializeSpi() {
     Button boot_button_;
     LcdDisplay* display_;
 
@@ -487,7 +394,6 @@ private:
     void InitializeLcdDisplay() {
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
-        // 液晶屏控制IO初始化
         ESP_LOGD(TAG, "Install panel IO");
         esp_lcd_panel_io_spi_config_t io_config = {};
         io_config.cs_gpio_num = DISPLAY_CS_PIN;
@@ -499,7 +405,6 @@ private:
         io_config.lcd_param_bits = 8;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io));
 
-        // 初始化液晶屏驱动芯片
         ESP_LOGD(TAG, "Install LCD driver");
         esp_lcd_panel_dev_config_t panel_config = {};
         panel_config.reset_gpio_num = DISPLAY_RST_PIN;
@@ -512,22 +417,21 @@ private:
         gc9a01_vendor_config_t gc9107_vendor_config = {
             .init_cmds = gc9107_lcd_init_cmds,
             .init_cmds_size = sizeof(gc9107_lcd_init_cmds) / sizeof(gc9a01_lcd_init_cmd_t),
-        };        
+        };
 #else
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
 #endif
-        
-        esp_lcd_panel_reset(panel);
 
+        esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, DISPLAY_INVERT_COLOR);
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-#ifdef  LCD_TYPE_GC9A01_SERIAL
+#ifdef LCD_TYPE_GC9A01_SERIAL
         panel_config.vendor_config = &gc9107_vendor_config;
 #endif
-       display_ = new SpiLcdDisplay(panel_io, panel,
-                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new SpiLcdDisplay(panel_io, panel,
+                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
     void InitializeButtons() {
@@ -541,7 +445,6 @@ private:
         });
     }
 
-    // 物联网初始化，添加对 AI 可见设备
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
     }
@@ -553,17 +456,13 @@ public:
         InitializeLcdDisplay();
         InitializeButtons();
         InitializeTools();
-        InitializeHeadSensors(); // 这是你新增的传感器初始化
-        
+
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
             GetBacklight()->RestoreBrightness();
         }
 
-        // 1. 启动上半身4舵机错峰 + 底部5/6号双齿轮同步控制
+        // 1. 启动上半身4舵机错峰 + 底部5/6号双齿轮同步控制 + 头部三路传感器检测
         InitStaggeredServosAndSensors();
-
-        // 2. 注册预设动作工具 (含底部双齿轮履带同步前进/后退/转向)
-        McpServer::GetInstance().AddTool("self.servo.do_action",
 
         // 2. 注册预设动作工具（含底部双齿轮履带同步前进/后退/转向）
         McpServer::GetInstance().AddTool("self.servo.do_action",
@@ -585,16 +484,16 @@ public:
                         SetServoTargetSafe(2, 150);
                         SetServoTargetSafe(3, 30);
                         break;
-                    case 6: // 5号、6号双齿轮同步前进
+                    case 6:
                         SetGearTrackSync(65, 0);
                         break;
-                    case 7: // 5号、6号双齿轮同步后退
+                    case 7:
                         SetGearTrackSync(-65, 0);
                         break;
-                    case 8: // 5号、6号双齿轮同步原地左转
+                    case 8:
                         SetGearTrackSync(55, 1);
                         break;
-                    case 9: // 5号、6号双齿轮同步原地右转
+                    case 9:
                         SetGearTrackSync(55, 2);
                         break;
                     case 0:
@@ -606,6 +505,7 @@ public:
                 return true;
             });
     }
+
     virtual Led* GetLed() override {
         static SingleLed led(BUILTIN_LED_GPIO);
         return &led;
