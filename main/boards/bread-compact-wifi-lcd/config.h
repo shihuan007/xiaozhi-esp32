@@ -287,4 +287,9 @@
 #define LAMP_GPIO GPIO_NUM_18
 // 新增：MG90S 舵机信号引脚 (对应底板 ML307R 插座 TXD 孔)
 #define SERVO_SIGNAL_GPIO GPIO_NUM_17
+// ================= 头部三路感应模块引脚定义 =================
+// 对应 ML307R 4G模块排母座上的 TXD / EN / RXD 引脚
+#define HEAD_TOUCH_GPIO      GPIO_NUM_13  // 头顶 TTP223 触摸模块 (接 TXD 孔，高电平触发)
+#define HEAD_IR_LEFT_GPIO    GPIO_NUM_11  // 头部左侧红外避障模块 (接 EN 孔，低电平触发)
+#define HEAD_IR_RIGHT_GPIO   GPIO_NUM_12  // 头部右侧红外避障模块 (接 RXD 孔，低电平触发)
 #endif // _BOARD_CONFIG_H_
