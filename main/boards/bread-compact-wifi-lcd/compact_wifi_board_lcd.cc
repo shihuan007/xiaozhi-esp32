@@ -1,3 +1,5 @@
+#include <esp_timer.h>
+#include <driver/gpio.h>
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
 #include "display/lcd_display.h"
@@ -342,7 +344,95 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
 
 class CompactWifiBoardLCD : public WifiBoard {
 private:
- 
+ class CompactWifiBoardLCD : public WifiBoard {
+private:
+    Button boot_button_;
+    LcdDisplay* display_;
+    
+    // 👇 从这里开始粘贴（第 350 行位置）👇
+    esp_timer_handle_t head_sensor_timer_ = nullptr;
+    int64_t last_trigger_time_ms_ = 0;
+
+    void InitializeHeadSensors() {
+        gpio_config_t io_conf = {};
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        io_conf.mode = GPIO_MODE_INPUT;
+        io_conf.pin_bit_mask = (1ULL << HEAD_TOUCH_GPIO) | 
+                               (1ULL << HEAD_IR_LEFT_GPIO) | 
+                               (1ULL << HEAD_IR_RIGHT_GPIO);
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        gpio_config(&io_conf);
+
+        esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                static_cast<CompactWifiBoardLCD*>(arg)->CheckHeadSensors();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "head_sensor_timer",
+            .skip_unhandled_events = true
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &head_sensor_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(head_sensor_timer_, 50 * 1000));
+    }
+
+    void CheckHeadSensors() {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_trigger_time_ms_ < 1500) {
+            return;
+        }
+
+        bool touch_active = (gpio_get_level(HEAD_TOUCH_GPIO) == 1);
+        bool left_ir_active = (gpio_get_level(HEAD_IR_LEFT_GPIO) == 0);
+        bool right_ir_active = (gpio_get_level(HEAD_IR_RIGHT_GPIO) == 0);
+
+        if (!touch_active && !left_ir_active && !right_ir_active) {
+            return;
+        }
+
+        last_trigger_time_ms_ = now_ms;
+
+        Application::GetInstance().Schedule([this, touch_active, left_ir_active, right_ir_active]() {
+            auto display = GetDisplay();
+            auto& app = Application::GetInstance();
+
+            if (touch_active) {
+                ESP_LOGI(TAG, "头顶被触摸 (GPIO 13)");
+                if (display) {
+                    display->SetEmotion("happy");
+                    display->SetChatMessage("system", "感受到摸头啦~");
+                }
+                if (app.GetDeviceState() == kDeviceStateIdle) {
+                    app.ToggleChatState();
+                }
+            } 
+            else if (left_ir_active && right_ir_active) {
+                ESP_LOGI(TAG, "正前方双侧同时感应到靠近 (GPIO 11 & 12)");
+                if (display) {
+                    display->SetEmotion("surprised");
+                    display->SetChatMessage("system", "哇！离我太近啦！");
+                }
+            } 
+            else if (left_ir_active) {
+                ESP_LOGI(TAG, "左侧感应到靠近 (GPIO 11)");
+                if (display) {
+                    display->SetEmotion("thinking");
+                    display->SetChatMessage("system", "左边有动静 👀");
+                }
+            } 
+            else if (right_ir_active) {
+                ESP_LOGI(TAG, "右侧感应到靠近 (GPIO 12)");
+                if (display) {
+                    display->SetEmotion("cool");
+                    display->SetChatMessage("system", "右边有动静 👀");
+                }
+            }
+        });
+    }
+    // 👆 粘贴到这里结束，下面是原本的 InitializeSpi() 👆
+
+    void InitializeSpi() {
     Button boot_button_;
     LcdDisplay* display_;
 
@@ -426,12 +516,17 @@ public:
         InitializeLcdDisplay();
         InitializeButtons();
         InitializeTools();
+        InitializeHeadSensors(); // 这是你新增的传感器初始化
+        
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
             GetBacklight()->RestoreBrightness();
         }
 
         // 1. 启动上半身4舵机错峰 + 底部5/6号双齿轮同步控制
         InitStaggeredServosAndSensors();
+
+        // 2. 注册预设动作工具 (含底部双齿轮履带同步前进/后退/转向)
+        McpServer::GetInstance().AddTool("self.servo.do_action",
 
         // 2. 注册预设动作工具（含底部双齿轮履带同步前进/后退/转向）
         McpServer::GetInstance().AddTool("self.servo.do_action",
