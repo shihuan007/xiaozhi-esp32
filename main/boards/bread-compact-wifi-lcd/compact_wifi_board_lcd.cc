@@ -348,12 +348,45 @@ private:
 private:
     Button boot_button_;
     LcdDisplay* display_;
-    
-    // 👇 从这里开始粘贴（第 350 行位置）👇
+// 👇 粘贴在第 349 行 LcdDisplay* display_; 的正下方 👇
     esp_timer_handle_t head_sensor_timer_ = nullptr;
     int64_t last_trigger_time_ms_ = 0;
 
+    // 控制 GPIO_NUM_17 (SERVO_SIGNAL_GPIO) 舵机角度 (0° ~ 180°)
+    void SetHeadServoAngle(int angle) {
+        if (angle < 0) angle = 0;
+        if (angle > 180) angle = 180;
+        // MG90S 标准脉宽：500us (0°) ~ 2500us (180°)，90° 为正中 (1500us)
+        uint32_t pulse_us = 500 + (angle * 2000) / 180;
+        // 50Hz 周期为 20000us，14位分辨率最大占空比为 16384
+        uint32_t duty = (pulse_us * 16384) / 20000;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_7);
+    }
+
     void InitializeHeadSensors() {
+        // 1. 初始化 GPIO_NUM_17 头部舵机 PWM (50Hz)
+        ledc_timer_config_t servo_timer = {};
+        servo_timer.speed_mode = LEDC_LOW_SPEED_MODE;
+        servo_timer.duty_resolution = LEDC_TIMER_14_BIT;
+        servo_timer.timer_num = LEDC_TIMER_3;
+        servo_timer.freq_hz = 50;
+        servo_timer.clk_cfg = LEDC_AUTO_CLK;
+        ESP_ERROR_CHECK(ledc_timer_config(&servo_timer));
+
+        ledc_channel_config_t servo_channel = {};
+        servo_channel.gpio_num = SERVO_SIGNAL_GPIO; // 即 config.h 中的 GPIO_NUM_17
+        servo_channel.speed_mode = LEDC_LOW_SPEED_MODE;
+        servo_channel.channel = LEDC_CHANNEL_7;
+        servo_channel.timer_sel = LEDC_TIMER_3;
+        servo_channel.duty = 0;
+        servo_channel.hpoint = 0;
+        ESP_ERROR_CHECK(ledc_channel_config(&servo_channel));
+
+        // 开机默认让头部舵机归位到 90° 正中位置
+        SetHeadServoAngle(90);
+
+        // 2. 初始化 GPIO 11, 12, 13 三路头部传感器为输入模式
         gpio_config_t io_conf = {};
         io_conf.intr_type = GPIO_INTR_DISABLE;
         io_conf.mode = GPIO_MODE_INPUT;
@@ -364,6 +397,7 @@ private:
         io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
         gpio_config(&io_conf);
 
+        // 3. 启动 50ms 周期定时器检测传感器
         esp_timer_create_args_t timer_args = {
             .callback = [](void* arg) {
                 static_cast<CompactWifiBoardLCD*>(arg)->CheckHeadSensors();
@@ -380,7 +414,7 @@ private:
     void CheckHeadSensors() {
         int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - last_trigger_time_ms_ < 1500) {
-            return;
+            return; // 1.5秒防抖冷却
         }
 
         bool touch_active = (gpio_get_level(HEAD_TOUCH_GPIO) == 1);
@@ -398,7 +432,8 @@ private:
             auto& app = Application::GetInstance();
 
             if (touch_active) {
-                ESP_LOGI(TAG, "头顶被触摸 (GPIO 13)");
+                ESP_LOGI(TAG, "头顶被触摸 (GPIO 13) -> 头部回正 90°");
+                SetHeadServoAngle(90); // 摸头时回正
                 if (display) {
                     display->SetEmotion("happy");
                     display->SetChatMessage("system", "感受到摸头啦~");
@@ -408,21 +443,24 @@ private:
                 }
             } 
             else if (left_ir_active && right_ir_active) {
-                ESP_LOGI(TAG, "正前方双侧同时感应到靠近 (GPIO 11 & 12)");
+                ESP_LOGI(TAG, "正前方双侧同时感应 (GPIO 11 & 12) -> 头部居中 90°");
+                SetHeadServoAngle(90); // 正前方靠近时居中
                 if (display) {
                     display->SetEmotion("surprised");
                     display->SetChatMessage("system", "哇！离我太近啦！");
                 }
             } 
             else if (left_ir_active) {
-                ESP_LOGI(TAG, "左侧感应到靠近 (GPIO 11)");
+                ESP_LOGI(TAG, "左侧感应到靠近 (GPIO 11) -> 舵机转头 135°");
+                SetHeadServoAngle(135); // 如果舵机安装方向相反，可与下面的 45 对调
                 if (display) {
                     display->SetEmotion("thinking");
                     display->SetChatMessage("system", "左边有动静 👀");
                 }
             } 
             else if (right_ir_active) {
-                ESP_LOGI(TAG, "右侧感应到靠近 (GPIO 12)");
+                ESP_LOGI(TAG, "右侧感应到靠近 (GPIO 12) -> 舵机转头 45°");
+                SetHeadServoAngle(45);  // 如果舵机安装方向相反，可与上面的 135 对调
                 if (display) {
                     display->SetEmotion("cool");
                     display->SetChatMessage("system", "右边有动静 👀");
@@ -430,8 +468,7 @@ private:
             }
         });
     }
-    // 👆 粘贴到这里结束，下面是原本的 InitializeSpi() 👆
-
+    // 👆 粘贴到此结束，下面是原本的第 351 行 void InitializeSpi() 👆
     void InitializeSpi() {
     Button boot_button_;
     LcdDisplay* display_;
