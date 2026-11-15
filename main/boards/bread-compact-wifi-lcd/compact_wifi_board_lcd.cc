@@ -194,7 +194,12 @@ static void StaggeredServoTask(void* arg) {
             continue;
         }
 
-        // 3. 全部空闲时，检测摸头(GPIO13)与左右红外避障(GPIO11/12)，联动舵机、屏幕表情与语音唤醒
+   // 3. 全部空闲时，检测摸头(GPIO13)与左右红外避障(GPIO11/12)，联动舵机、屏幕表情与语音唤醒
+        // 👇 在这里插入下面这 3 行防崩溃补丁（原第 196 行位置）👇
+        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+            continue;
+        }
+
         if (auto_reset_ticks > 0) {
             auto_reset_ticks--;
             if (auto_reset_ticks == 0) {
@@ -247,7 +252,7 @@ static void StaggeredServoTask(void* arg) {
 
                 Application::GetInstance().Schedule([]() {
                     auto display = Board::GetInstance().GetDisplay();
-                    if (display) {
+                    if (display) 
                         display->SetEmotion("thinking");
                         display->SetChatMessage("system", "左边有动静 👀");
                     }
