@@ -25,10 +25,11 @@
 #define TAG "CompactWifiBoardLCD"
 
 // ==================== 4舵机错峰 + 5/6号双齿轮履带【同步驱动】+ 头部三路传感器模块 ====================
+// 舵机引脚（避开 GPIO 11/12/13 传感器引脚及 GPIO 21 等系统引脚）
 #define SERVO_PAN_GPIO         GPIO_NUM_14   // 1号舵机: 头部左右摇头 (head_lr)
 #define SERVO_TILT_GPIO        GPIO_NUM_17   // 2号舵机: 头部上下点头 (head_ud)
 #define SERVO_LEFT_ARM_GPIO    GPIO_NUM_18   // 3号舵机: 左手挥臂 (left_hand)
-#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_21   // 4号舵机: 右手挥臂 (right_hand)
+#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_3    // 4号舵机: 右手挥臂 (right_hand)
 #define SERVO_LEFT_GEAR_GPIO   GPIO_NUM_10   // 5号舵机: 左侧齿轮履带 (left_gear)
 #define SERVO_RIGHT_GEAR_GPIO  GPIO_NUM_9    // 6号舵机: 右侧齿轮履带 (right_gear)
 
@@ -116,6 +117,17 @@ static void SetGearTrackSync(int delta_deg, int turn_mode = 0) {
 }
 
 static void StaggeredServoTask(void* arg) {
+    // 1. 开机先静默等待 3 秒，确保 WiFi 配网热点 (192.168.4.1) 和 Application 主循环完全启动！
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // 2. 在后台任务中错峰归中舵机，绝不阻塞主线程和 Web 配网服务器
+    for (int i = 0; i < SERVO_TOTAL_NUM; i++) {
+        ServoWriteAngle(i, 90);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ServoDetach(i);
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
+
     int active_upper_idx = -1;
     bool gears_sync_active = false;
     int cooldown_ticks = 0;
@@ -123,6 +135,13 @@ static void StaggeredServoTask(void* arg) {
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_MS));
+
+        // 如果系统正在启动或处于配网模式（非 Idle 待机状态），直接休眠等待，让出全部 CPU 给配网网页
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateStarting ||
+            Application::GetInstance().GetDeviceState() == kDeviceStateWifiConfiguring) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
         if (active_upper_idx == -1 && !gears_sync_active) {
             if (cooldown_ticks > 0) {
@@ -192,8 +211,7 @@ static void StaggeredServoTask(void* arg) {
             continue;
         }
 
-        // 3. 全部空闲时，检测摸头(GPIO13)与左右红外避障(GPIO11/12)
-        // 防崩溃补丁：仅在配网完成并进入 Idle 待机状态后响应传感器
+        // 仅在 Idle 待机状态下检测摸头与左右红外避障
         if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
             continue;
         }
@@ -293,6 +311,7 @@ static void InitStaggeredServosAndSensors() {
     timer_conf.clk_cfg = LEDC_AUTO_CLK;
     ledc_timer_config(&timer_conf);
 
+    // 仅注册通道，耗时 0ms（归中动作已移至 StaggeredServoTask 后台任务）
     for (int i = 0; i < SERVO_TOTAL_NUM; i++) {
         ledc_channel_config_t ch_conf = {};
         ch_conf.gpio_num = g_servos[i].pin;
@@ -302,11 +321,6 @@ static void InitStaggeredServosAndSensors() {
         ch_conf.duty = 0;
         ch_conf.hpoint = 0;
         ledc_channel_config(&ch_conf);
-
-        ServoWriteAngle(i, 90);
-        vTaskDelay(pdMS_TO_TICKS(220));
-        ServoDetach(i);
-        vTaskDelay(pdMS_TO_TICKS(60));
     }
 
     McpServer::GetInstance().AddTool("self.servo.set_angles",
@@ -331,7 +345,8 @@ static void InitStaggeredServosAndSensors() {
             return true;
         });
 
-    xTaskCreate(StaggeredServoTask, "servo_stagger", 4096, nullptr, 5, nullptr);
+    // 以最低优先级 (2) 启动后台任务，绝不抢占 WiFi 配网与语音线程
+    xTaskCreate(StaggeredServoTask, "servo_stagger", 4096, nullptr, 2, nullptr);
 }
 
 #if defined(LCD_TYPE_ILI9341_SERIAL)
@@ -460,7 +475,7 @@ public:
             GetBacklight()->RestoreBrightness();
         }
 
-        // 1. 启动上半身4舵机错峰 + 底部5/6号双齿轮同步控制 + 头部三路传感器检测
+        // 1. 零延时注册舵机与传感器通道（实际归中在后台 3 秒后执行）
         InitStaggeredServosAndSensors();
 
         // 2. 注册预设动作工具（含底部双齿轮履带同步前进/后退/转向）
