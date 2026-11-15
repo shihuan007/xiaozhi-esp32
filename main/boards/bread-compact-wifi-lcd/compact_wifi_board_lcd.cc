@@ -24,32 +24,30 @@
 
 #define TAG "CompactWifiBoardLCD"
 
-// ==================== 【位置二】4舵机错峰 + 5/6号双齿轮履带【同步驱动】模块 ====================
-// 注意：由于 GPIO 11/12/13 已用于接 4G 模块排母上的头部三路传感器，
-// 这里将 2/3/4 号舵机改为其他空闲引脚（如 GPIO 14/17/18/21），避免与传感器引脚冲突！
+// ==================== 4舵机错峰 + 5/6号双齿轮履带【同步驱动】+ 头部三路传感器模块 ====================
 #define SERVO_PAN_GPIO         GPIO_NUM_14   // 1号舵机: 头部左右摇头 (head_lr)
-#define SERVO_TILT_GPIO        GPIO_NUM_17   // 2号舵机: 头部上下点头 (head_ud) - 原13已让给摸头传感器
-#define SERVO_LEFT_ARM_GPIO    GPIO_NUM_18   // 3号舵机: 左手挥臂 (left_hand)   - 原12已让给右避障
-#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_21   // 4号舵机: 右手挥臂 (right_hand)  - 原11已让给左避障
+#define SERVO_TILT_GPIO        GPIO_NUM_17   // 2号舵机: 头部上下点头 (head_ud)
+#define SERVO_LEFT_ARM_GPIO    GPIO_NUM_18   // 3号舵机: 左手挥臂 (left_hand)
+#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_21   // 4号舵机: 右手挥臂 (right_hand)
 #define SERVO_LEFT_GEAR_GPIO   GPIO_NUM_10   // 5号舵机: 左侧齿轮履带 (left_gear)
 #define SERVO_RIGHT_GEAR_GPIO  GPIO_NUM_9    // 6号舵机: 右侧齿轮履带 (right_gear)
 
-// 对应你图五实际插在 4G 模块排母座 (TXD / EN / RXD) 上的三路头部传感器引脚：
-#define SENSOR_TOUCH_GPIO      GPIO_NUM_13   // 头顶 TTP223 触摸模块 (接 4G 排母 TXD 孔, 高电平触发)
-#define SENSOR_IR_LEFT_GPIO    GPIO_NUM_11   // 头部左侧红外避障模块 (接 4G 排母 EN 孔, 低电平触发)
-#define SENSOR_IR_RIGHT_GPIO   GPIO_NUM_12   // 头部右侧红外避障模块 (接 4G 排母 RXD 孔, 低电平触发)
+// 对应 4G 模块排母座 (TXD / EN / RXD) 上的三路头部传感器引脚：
+#define SENSOR_TOUCH_GPIO      GPIO_NUM_13   // 头顶 TTP223 触摸模块 (接 TXD 孔, 高电平触发)
+#define SENSOR_IR_LEFT_GPIO    GPIO_NUM_11   // 头部左侧红外避障模块 (接 EN 孔, 低电平触发)
+#define SENSOR_IR_RIGHT_GPIO   GPIO_NUM_12   // 头部右侧红外避障模块 (接 RXD 孔, 低电平触发)
 
-#define SERVO_UPPER_NUM        4             // 上半身错峰舵机数量 (索引 0~3)
-#define SERVO_TOTAL_NUM        6             // 总舵机数量 (索引 4, 5 为底部同步双齿轮)
-#define GEAR_LEFT_IDX          4             // 5号左齿轮舵机索引
-#define GEAR_RIGHT_IDX         5             // 6号右齿轮舵机索引
-#define GEAR_MIRROR_DIR        1             // 1=左右齿轮舵机背靠背镜像安装(自动反向同步); 0=同向安装
+#define SERVO_UPPER_NUM        4
+#define SERVO_TOTAL_NUM        6
+#define GEAR_LEFT_IDX          4
+#define GEAR_RIGHT_IDX         5
+#define GEAR_MIRROR_DIR        1
 
-#define SERVO_STEP_MS          20            // 每 20ms 微步更新一次
-#define SERVO_MAX_STEP_DEG     2             // 上半身单步最大角度: 2度/20ms
-#define GEAR_SYNC_STEP_DEG     2             // 底部双齿轮同步单步角度: 2度/20ms(限制双舵机同步电流)
-#define SERVO_HOLD_TICKS       6             // 到位保持 120ms 后自动切断 PWM 省电
-#define SERVO_COOLDOWN_TICKS   3             // 切换间歇 60ms 供板载5V电容回充
+#define SERVO_STEP_MS          20
+#define SERVO_MAX_STEP_DEG     2
+#define GEAR_SYNC_STEP_DEG     2
+#define SERVO_HOLD_TICKS       6
+#define SERVO_COOLDOWN_TICKS   3
 
 struct EspIdfStaggeredServo {
     gpio_num_t pin;
@@ -63,12 +61,12 @@ struct EspIdfStaggeredServo {
 };
 
 static EspIdfStaggeredServo g_servos[SERVO_TOTAL_NUM] = {
-    {SERVO_PAN_GPIO,        LEDC_CHANNEL_1, 90, 90, 30, 150, 0, false}, // 0: 头部左右
-    {SERVO_TILT_GPIO,       LEDC_CHANNEL_2, 90, 90, 55, 125, 0, false}, // 1: 头部上下
-    {SERVO_LEFT_ARM_GPIO,   LEDC_CHANNEL_3, 90, 90, 20, 160, 0, false}, // 2: 左手
-    {SERVO_RIGHT_ARM_GPIO,  LEDC_CHANNEL_4, 90, 90, 20, 160, 0, false}, // 3: 右手
-    {SERVO_LEFT_GEAR_GPIO,  LEDC_CHANNEL_5, 90, 90, 10, 170, 0, false}, // 4: 5号左齿轮履带(同步组)
-    {SERVO_RIGHT_GEAR_GPIO, LEDC_CHANNEL_6, 90, 90, 10, 170, 0, false}  // 5: 6号右齿轮履带(同步组)
+    {SERVO_PAN_GPIO,        LEDC_CHANNEL_1, 90, 90, 30, 150, 0, false},
+    {SERVO_TILT_GPIO,       LEDC_CHANNEL_2, 90, 90, 55, 125, 0, false},
+    {SERVO_LEFT_ARM_GPIO,   LEDC_CHANNEL_3, 90, 90, 20, 160, 0, false},
+    {SERVO_RIGHT_ARM_GPIO,  LEDC_CHANNEL_4, 90, 90, 20, 160, 0, false},
+    {SERVO_LEFT_GEAR_GPIO,  LEDC_CHANNEL_5, 90, 90, 10, 170, 0, false},
+    {SERVO_RIGHT_GEAR_GPIO, LEDC_CHANNEL_6, 90, 90, 10, 170, 0, false}
 };
 
 static uint32_t ServoAngleToDuty(int angle) {
@@ -194,8 +192,8 @@ static void StaggeredServoTask(void* arg) {
             continue;
         }
 
-   // 3. 全部空闲时，检测摸头(GPIO13)与左右红外避障(GPIO11/12)，联动舵机、屏幕表情与语音唤醒
-        // 👇 在这里插入下面这 3 行防崩溃补丁（原第 196 行位置）👇
+        // 3. 全部空闲时，检测摸头(GPIO13)与左右红外避障(GPIO11/12)
+        // 防崩溃补丁：仅在配网完成并进入 Idle 待机状态后响应传感器
         if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
             continue;
         }
@@ -203,7 +201,9 @@ static void StaggeredServoTask(void* arg) {
         if (auto_reset_ticks > 0) {
             auto_reset_ticks--;
             if (auto_reset_ticks == 0) {
-                for (int i = 0; i < SERVO_UPPER_NUM; i++) SetServoTargetSafe(i, 90);
+                for (int i = 0; i < SERVO_UPPER_NUM; i++) {
+                    SetServoTargetSafe(i, 90);
+                }
                 SetGearTrackSync(0, 0);
             }
         } else {
@@ -212,7 +212,6 @@ static void StaggeredServoTask(void* arg) {
             bool right_ir_active = (gpio_get_level(SENSOR_IR_RIGHT_GPIO) == 0);
 
             if (touch_active) {
-                // 摸头互动：抬头+挥双手 -> 底部双齿轮同步向前滚动一步 + 开心表情 + 语音唤醒
                 SetServoTargetSafe(0, 90);
                 SetServoTargetSafe(1, 65);
                 SetServoTargetSafe(2, 145);
@@ -232,7 +231,6 @@ static void StaggeredServoTask(void* arg) {
                     }
                 });
             } else if (left_ir_active && right_ir_active) {
-                // 正前方双侧同时遇障：惊讶表情 + 居中后退
                 SetServoTargetSafe(0, 90);
                 SetGearTrackSync(-45, 0);
                 auto_reset_ticks = 75;
@@ -245,20 +243,18 @@ static void StaggeredServoTask(void* arg) {
                     }
                 });
             } else if (left_ir_active) {
-                // 左侧遇障：头向左看 -> 底部双齿轮同步向右转向避障
                 SetServoTargetSafe(0, 135);
                 SetGearTrackSync(45, 2);
                 auto_reset_ticks = 75;
 
                 Application::GetInstance().Schedule([]() {
                     auto display = Board::GetInstance().GetDisplay();
-                    if (display) 
+                    if (display) {
                         display->SetEmotion("thinking");
                         display->SetChatMessage("system", "左边有动静 👀");
                     }
                 });
             } else if (right_ir_active) {
-                // 右侧遇障：头向右看 -> 底部双齿轮同步向左转向避障
                 SetServoTargetSafe(0, 45);
                 SetGearTrackSync(45, 1);
                 auto_reset_ticks = 75;
@@ -337,7 +333,6 @@ static void InitStaggeredServosAndSensors() {
 
     xTaskCreate(StaggeredServoTask, "servo_stagger", 4096, nullptr, 5, nullptr);
 }
-// =========================================================================================
 
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
@@ -346,7 +341,6 @@ static void InitStaggeredServosAndSensors() {
 #if defined(LCD_TYPE_GC9A01_SERIAL)
 #include "esp_lcd_gc9a01.h"
 static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
-    //  {cmd, { data }, data_size, delay_ms}
     {0xfe, (uint8_t[]){0x00}, 0, 0},
     {0xef, (uint8_t[]){0x00}, 0, 0},
     {0xb0, (uint8_t[]){0xc0}, 1, 0},
