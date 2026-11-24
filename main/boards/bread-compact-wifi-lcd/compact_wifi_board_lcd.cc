@@ -25,18 +25,18 @@
 #define TAG "CompactWifiBoardLCD"
 
 // ==================== 4舵机错峰 + 5/6号双齿轮履带【同步驱动】+ 头部三路传感器模块 ====================
-// 舵机引脚（避开 GPIO 11/12/13 传感器引脚及 GPIO 21 等系统引脚）
+// 6台舵机引脚（对应扩展板背面 14 / 13 / 12 / 11 / 10 / 9 焊点）
 #define SERVO_PAN_GPIO         GPIO_NUM_14   // 1号舵机: 头部左右摇头 (head_lr)
-#define SERVO_TILT_GPIO        GPIO_NUM_17   // 2号舵机: 头部上下点头 (head_ud)
-#define SERVO_LEFT_ARM_GPIO    GPIO_NUM_18   // 3号舵机: 左手挥臂 (left_hand)
-#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_3    // 4号舵机: 右手挥臂 (right_hand)
+#define SERVO_TILT_GPIO        GPIO_NUM_13   // 2号舵机: 头部上下点头 (head_ud)
+#define SERVO_LEFT_ARM_GPIO    GPIO_NUM_12   // 3号舵机: 左手挥臂 (left_hand)
+#define SERVO_RIGHT_ARM_GPIO   GPIO_NUM_11   // 4号舵机: 右手挥臂 (right_hand)
 #define SERVO_LEFT_GEAR_GPIO   GPIO_NUM_10   // 5号舵机: 左侧齿轮履带 (left_gear)
 #define SERVO_RIGHT_GEAR_GPIO  GPIO_NUM_9    // 6号舵机: 右侧齿轮履带 (right_gear)
 
-// 对应 4G 模块排母座 (TXD / EN / RXD) 上的三路头部传感器引脚：
-#define SENSOR_TOUCH_GPIO      GPIO_NUM_13   // 头顶 TTP223 触摸模块 (接 TXD 孔, 高电平触发)
-#define SENSOR_IR_LEFT_GPIO    GPIO_NUM_11   // 头部左侧红外避障模块 (接 EN 孔, 低电平触发)
-#define SENSOR_IR_RIGHT_GPIO   GPIO_NUM_12   // 头部右侧红外避障模块 (接 RXD 孔, 低电平触发)
+// 头部三路传感器引脚（对应扩展板背面 8 / 17 / 18 焊点，零冲突）：
+#define SENSOR_TOUCH_GPIO      GPIO_NUM_8    // 头顶 TTP223 触摸模块 (焊在背面 8 号脚, 高电平触发)
+#define SENSOR_IR_LEFT_GPIO    GPIO_NUM_17   // 头部左侧红外避障模块 (焊在背面 17 号脚, 低电平触发)
+#define SENSOR_IR_RIGHT_GPIO   GPIO_NUM_18   // 头部右侧红外避障模块 (焊在背面 18 号脚, 低电平触发)
 
 #define SERVO_UPPER_NUM        4
 #define SERVO_TOTAL_NUM        6
@@ -460,7 +460,7 @@ private:
     }
 
     void InitializeTools() {
-        static LampController lamp(LAMP_GPIO);
+        // static LampController lamp(LAMP_GPIO); // 注释掉示例测试灯，释放 GPIO 18 给右侧红外避障模块
     }
 
 public:
