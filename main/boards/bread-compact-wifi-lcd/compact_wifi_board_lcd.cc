@@ -611,8 +611,8 @@ public:
         if (!engine_.Init()) {
             return;
         }
-        memset(&img_dsc_, 0, sizeof(img_dsc_));
 #if LVGL_VERSION_MAJOR >= 9
+        memset(&img_dsc_, 0, sizeof(img_dsc_));
         img_dsc_.header.magic  = LV_IMAGE_HEADER_MAGIC;
         img_dsc_.header.cf     = LV_COLOR_FORMAT_RGB565;
         img_dsc_.header.flags  = 0;
@@ -645,9 +645,9 @@ public:
         }
     }
 
-    void SetEmotion(const char* emotion) override {
-        SpiLcdDisplay::SetEmotion(emotion);
-        if (!emotion) return;
+    bool SetEmotion(const char* emotion) override {
+        bool ok = SpiLcdDisplay::SetEmotion(emotion);
+        if (!emotion) return ok;
 
         matrix_face::Emotion mapped = matrix_face::kNeutral;
         if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "laughing") == 0 || strcmp(emotion, "funny") == 0) {
@@ -670,6 +670,7 @@ public:
             mapped = matrix_face::kSleepy;
         }
         current_emotion_.store(static_cast<int>(mapped));
+        return ok;
     }
 
     void SetGazeHint(float gaze_x) {
