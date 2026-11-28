@@ -1,4 +1,6 @@
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
+#include <esp_random.h>
 #include <driver/gpio.h>
 #include <driver/ledc.h>
 #include <driver/i2c_master.h>
@@ -9,7 +11,10 @@
 #include <esp_lcd_panel_ops.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <lvgl.h>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
@@ -23,6 +28,722 @@
 #include "led/single_led.h"
 
 #define TAG "CompactWifiBoardLCD"
+
+// 如果烧录后发现点阵颜色红蓝错乱或发花，把此项改为 1 重新编译即可
+#define MATRIX_SWAP_RGB565     0
+// 200x200 居中画布垂直偏移（像素）：负值上移留给底部字幕，正值下移留给顶部状态栏
+#define MATRIX_OFFSET_Y        0
+// 画布圆角半径（像素）：0 为直角，16 为柔和圆角窗口
+#define MATRIX_CORNER_RADIUS   16
+
+// ==================== 100% 原创 200x200 (40x40灯珠) 居中发光点阵表情引擎 ====================
+namespace matrix_face {
+
+enum Emotion : int {
+    kNeutral = 0,
+    kHappy,
+    kSurprised,
+    kThinking,
+    kCool,
+    kSad,
+    kAngry,
+    kSleepy,
+    kLoving,
+    kWinking
+};
+
+// 8色发光调色板: 0青蓝, 1暖白, 2樱花粉, 3薄荷绿, 4琥珀金, 5珊瑚红, 6柔紫, 7冰天蓝
+constexpr uint8_t kPalette[8][3] = {
+    { 65, 215, 255},
+    {255, 240, 215},
+    {255, 105, 165},
+    { 90, 240, 145},
+    {255, 195,  55},
+    {255,  75,  65},
+    {185, 125, 255},
+    {135, 235, 255}
+};
+
+class DotMatrixEngine {
+public:
+    static constexpr int kCols = 40;
+    static constexpr int kRows = 40;
+    static constexpr int kCell = 5;
+    static constexpr int kWidth  = kCols * kCell;  // 200px
+    static constexpr int kHeight = kRows * kCell;  // 200px
+    static constexpr int kCells  = kCols * kRows;  // 1600颗灯珠
+
+    ~DotMatrixEngine() {
+        if (fb_) free(fb_);
+        if (bloom_) free(bloom_);
+    }
+
+    bool Init() {
+        // 200x200 帧缓冲 (78KB) 放 PSRAM，节省内部 DRAM
+        fb_ = static_cast<uint16_t*>(
+            heap_caps_malloc(kWidth * kHeight * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!fb_) {
+            fb_ = static_cast<uint16_t*>(malloc(kWidth * kHeight * sizeof(uint16_t)));
+        }
+        // 光晕缓冲 (4.7KB) 优先分配内部 SRAM，减少 PSRAM 总线争抢
+        bloom_ = static_cast<uint8_t*>(
+            heap_caps_malloc(kCells * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (!bloom_) {
+            bloom_ = static_cast<uint8_t*>(
+                heap_caps_malloc(kCells * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        }
+        if (!bloom_) {
+            bloom_ = static_cast<uint8_t*>(malloc(kCells * 3));
+        }
+        if (!fb_ || !bloom_) {
+            ESP_LOGE(TAG, "DotMatrixEngine buffer alloc failed");
+            return false;
+        }
+
+        PrecomputeMasks();
+        memset(grid_, 0, sizeof(grid_));
+        memset(fb_, 0, kWidth * kHeight * sizeof(uint16_t));
+        next_blink_t_ = 2.6f;
+        next_saccade_t_ = 1.8f;
+        return true;
+    }
+
+    uint16_t* Framebuffer() const { return fb_; }
+
+    void StepAndRender(float dt, Emotion emotion, DeviceState state, float gaze_hint_x, int theme_color_idx) {
+        if (!fb_ || !bloom_) return;
+        if (dt < 0.001f) dt = 0.001f;
+        if (dt > 0.12f) dt = 0.12f;
+        time_s_ += dt;
+
+        UpdateMotion(dt, emotion, state, gaze_hint_x);
+        memset(grid_, 0, sizeof(grid_));
+
+        uint8_t eye_color = PickEyeColor(emotion, state, theme_color_idx);
+        DrawExpression(emotion, state, eye_color);
+        DrawStateOverlay(emotion, state, eye_color);
+        RenderGlowFrame();
+    }
+
+private:
+    static inline float ClampF(float v, float lo, float hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    static inline uint16_t PackRgb565(uint8_t r, uint8_t g, uint8_t b) {
+        uint16_t c = static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+#if MATRIX_SWAP_RGB565
+        c = static_cast<uint16_t>((c >> 8) | (c << 8));
+#endif
+        return c;
+    }
+
+    static float Rand01() {
+        return static_cast<float>(esp_random() & 0xFFFF) / 65535.0f;
+    }
+
+    void PrecomputeMasks() {
+        for (int val = 0; val < 256; ++val) {
+            int lvl = val & 31;
+            int cid = val >> 5;
+            float b = static_cast<float>(lvl) / 31.0f;
+            color_lut_[val][0] = static_cast<uint8_t>(kPalette[cid][0] * b + 0.5f);
+            color_lut_[val][1] = static_cast<uint8_t>(kPalette[cid][1] * b + 0.5f);
+            color_lut_[val][2] = static_cast<uint8_t>(kPalette[cid][2] * b + 0.5f);
+            bright_lut_[val]   = static_cast<uint8_t>(b * 255.0f + 0.5f);
+            hot_lut_[val]      = static_cast<uint16_t>(b * b * 0.42f * 256.0f + 0.5f);
+        }
+
+        const float center = (kCell - 1) * 0.5f;  // 2.0
+        for (int sy = 0; sy < kCell; ++sy) {
+            for (int sx = 0; sx < kCell; ++sx) {
+                float dx = sx - center;
+                float dy = sy - center;
+                float dist = sqrtf(dx * dx + dy * dy);
+
+                // 圆形灯珠边缘平滑衰减 + 中心高光 + 未亮灯珠暗灰底纹
+                float dot_f   = ClampF((2.25f - dist) / 0.85f, 0.0f, 1.0f);
+                float core_f  = ClampF((1.15f - dist) / 0.80f, 0.0f, 1.0f);
+                float unlit_f = ClampF((1.75f - dist) / 0.90f, 0.0f, 1.0f);
+                float halo_f  = 0.82f * (1.0f - 0.55f * dot_f);
+
+                dot_w_[sy][sx]   = static_cast<uint16_t>(dot_f * 256.0f + 0.5f);
+                core_w_[sy][sx]  = static_cast<uint16_t>(core_f * 256.0f + 0.5f);
+                unlit_w_[sy][sx] = static_cast<uint16_t>(unlit_f * 256.0f + 0.5f);
+                halo_w_[sy][sx]  = static_cast<uint16_t>(halo_f * 256.0f + 0.5f);
+
+                uint8_t ur = static_cast<uint8_t>(4 + 16 * unlit_f);
+                uint8_t ug = static_cast<uint8_t>(5 + 17 * unlit_f);
+                uint8_t ub = static_cast<uint8_t>(8 + 20 * unlit_f);
+                unlit_tile_[sy][sx] = PackRgb565(ur, ug, ub);
+            }
+        }
+    }
+
+    void PlotCell(int x, int y, uint8_t color_idx, float intensity) {
+        if (x < 0 || x >= kCols || y < 0 || y >= kRows) return;
+        if (intensity <= 0.01f) return;
+        int lvl = static_cast<int>(ClampF(intensity, 0.0f, 1.0f) * 31.0f + 0.5f);
+        if (lvl <= 0) return;
+        if (lvl > 31) lvl = 31;
+        uint8_t& dst = grid_[y * kCols + x];
+        if (lvl >= (dst & 31)) {
+            dst = static_cast<uint8_t>(((color_idx & 7) << 5) | lvl);
+        }
+    }
+
+    static float SdRoundBox(float px, float py, float hw, float hh, float r) {
+        float qx = fabsf(px) - (hw - r);
+        float qy = fabsf(py) - (hh - r);
+        float ox = qx > 0.0f ? qx : 0.0f;
+        float oy = qy > 0.0f ? qy : 0.0f;
+        float inside = (qx > qy ? qx : qy);
+        if (inside > 0.0f) inside = 0.0f;
+        return sqrtf(ox * ox + oy * oy) + inside - r;
+    }
+
+    void DrawStyledEye(float cx, float cy, float hw, float hh, float radius,
+                       float lid_cut_y, float lid_slope, uint8_t color_idx, float gain) {
+        // 半径限幅：防止眨眼高度变窄时眼睛横向缩成小圆点
+        float r = fminf(radius, fminf(hw, hh));
+        if (r < 0.0f) r = 0.0f;
+
+        int x0 = static_cast<int>(floorf(cx - hw - 2.0f));
+        int x1 = static_cast<int>(ceilf(cx + hw + 2.0f));
+        int y0 = static_cast<int>(floorf(cy - hh - 2.0f));
+        int y1 = static_cast<int>(ceilf(cy + hh + 2.0f));
+
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                float px = static_cast<float>(x) - cx;
+                float py = static_cast<float>(y) - cy;
+                float d = SdRoundBox(px, py, hw, hh, r);
+                if (lid_cut_y > -20.0f) {
+                    float d_lid = (lid_cut_y + lid_slope * px) - py;
+                    if (d_lid > d) d = d_lid;
+                }
+                float cov = ClampF(0.85f - d, 0.0f, 1.0f);
+                if (cov > 0.02f) {
+                    float shade = 0.88f + 0.12f * ClampF(-py / (hh + 1.0f), 0.0f, 1.0f);
+                    PlotCell(x, y, color_idx, cov * gain * shade);
+                }
+            }
+        }
+    }
+
+    // 弯月笑眼 (^ ^)
+    void DrawHappyArcEye(float cx, float cy, float span_x, float arch_h, float thickness, uint8_t color_idx, float gain) {
+        int x0 = static_cast<int>(floorf(cx - span_x - 2.0f));
+        int x1 = static_cast<int>(ceilf(cx + span_x + 2.0f));
+        int y0 = static_cast<int>(floorf(cy - arch_h - 3.0f));
+        int y1 = static_cast<int>(ceilf(cy + 4.0f));
+        float inv_span = 1.0f / span_x;
+
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                float dx = static_cast<float>(x) - cx;
+                float nx = ClampF(dx * inv_span, -1.0f, 1.0f);
+                float curve_x = cx + nx * span_x;
+                float curve_y = cy - arch_h * (1.0f - nx * nx);
+                float dist = sqrtf((x - curve_x) * (x - curve_x) + (y - curve_y) * (y - curve_y));
+                float cov = ClampF(thickness + 0.55f - dist, 0.0f, 1.0f);
+                if (cov > 0.02f) {
+                    PlotCell(x, y, color_idx, cov * gain);
+                }
+            }
+        }
+    }
+
+    // 惊讶圆环眼 (O O)
+    void DrawRingEye(float cx, float cy, float outer_r, float ring_thick, uint8_t color_idx, float gain) {
+        int r_lim = static_cast<int>(ceilf(outer_r + 2.0f));
+        int icx = static_cast<int>(cx + 0.5f);
+        int icy = static_cast<int>(cy + 0.5f);
+        for (int y = icy - r_lim; y <= icy + r_lim; ++y) {
+            for (int x = icx - r_lim; x <= icx + r_lim; ++x) {
+                float dx = x - cx;
+                float dy = y - cy;
+                float dist = sqrtf(dx * dx + dy * dy);
+                float d_ring = fabsf(dist - (outer_r - ring_thick * 0.5f)) - ring_thick * 0.5f;
+                float cov = ClampF(0.75f - d_ring, 0.0f, 1.0f);
+                float d_pupil = dist - 1.3f;
+                float cov_p = ClampF(0.75f - d_pupil, 0.0f, 1.0f) * 0.85f;
+                float m = cov > cov_p ? cov : cov_p;
+                if (m > 0.02f) {
+                    PlotCell(x, y, color_idx, m * gain);
+                }
+            }
+        }
+    }
+
+    // 椭圆发光腮红 / 泪滴 / 小圆点
+    void DrawSoftOval(float cx, float cy, float rx, float ry, uint8_t color_idx, float gain) {
+        int x0 = static_cast<int>(floorf(cx - rx - 1.5f));
+        int x1 = static_cast<int>(ceilf(cx + rx + 1.5f));
+        int y0 = static_cast<int>(floorf(cy - ry - 1.5f));
+        int y1 = static_cast<int>(ceilf(cy + ry + 1.5f));
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                float nx = (x - cx) / rx;
+                float ny = (y - cy) / ry;
+                float d = sqrtf(nx * nx + ny * ny);
+                float cov = ClampF((1.15f - d) * 1.6f, 0.0f, 1.0f);
+                if (cov > 0.02f) {
+                    PlotCell(x, y, color_idx, cov * gain);
+                }
+            }
+        }
+    }
+
+    void UpdateMotion(float dt, Emotion emotion, DeviceState state, float gaze_hint_x) {
+        bool can_blink = (emotion == kNeutral || emotion == kThinking || emotion == kCool ||
+                          emotion == kSad || emotion == kAngry || emotion == kLoving);
+        if (can_blink) {
+            if (blink_phase_ > 0.0f) {
+                blink_phase_ += dt * 7.2f;  // 单次眨眼约 0.28 秒
+                if (blink_phase_ >= 2.0f) {
+                    blink_phase_ = 0.0f;
+                    next_blink_t_ = time_s_ + 2.4f + Rand01() * 3.4f;
+                }
+            } else if (time_s_ >= next_blink_t_) {
+                blink_phase_ = 0.01f;
+            }
+        } else {
+            blink_phase_ = 0.0f;
+        }
+
+        if (fabsf(gaze_hint_x) > 0.1f) {
+            target_gaze_x_ = ClampF(gaze_hint_x, -3.5f, 3.5f);
+            target_gaze_y_ = -0.5f;
+        } else if (state == kDeviceStateListening) {
+            target_gaze_x_ = 0.0f;
+            target_gaze_y_ = -0.6f;
+        } else if (emotion == kThinking) {
+            target_gaze_x_ = -2.8f;
+            target_gaze_y_ = -1.3f;
+        } else if (emotion == kCool) {
+            target_gaze_x_ = 2.6f;
+            target_gaze_y_ = 0.0f;
+        } else if (emotion == kSad) {
+            target_gaze_x_ = 0.0f;
+            target_gaze_y_ = 2.0f;
+        } else if (time_s_ >= next_saccade_t_) {
+            float r = Rand01();
+            if (r < 0.45f) {
+                target_gaze_x_ = 0.0f;
+                target_gaze_y_ = 0.0f;
+            } else {
+                target_gaze_x_ = (Rand01() - 0.5f) * 4.8f;
+                target_gaze_y_ = (Rand01() - 0.5f) * 2.0f;
+            }
+            next_saccade_t_ = time_s_ + 1.6f + Rand01() * 2.6f;
+        }
+
+        float smooth = ClampF(dt * 9.0f, 0.0f, 1.0f);
+        gaze_x_ += (target_gaze_x_ - gaze_x_) * smooth;
+        gaze_y_ += (target_gaze_y_ - gaze_y_) * smooth;
+    }
+
+    uint8_t PickEyeColor(Emotion emotion, DeviceState state, int theme_color_idx) const {
+        if (emotion == kAngry)     return 5;  // 珊瑚红
+        if (emotion == kLoving)    return 2;  // 樱花粉
+        if (emotion == kSurprised) return 4;  // 琥珀金
+        if (emotion == kThinking)  return 6;  // 柔紫
+        if (emotion == kSad)       return 7;  // 冰天蓝
+        if (emotion == kHappy)     return 1;  // 暖白（配樱花粉腮红）
+        if (state == kDeviceStateListening) return 3;  // 薄荷绿
+        if (state == kDeviceStateSpeaking)  return 0;  // 亮青蓝
+        return static_cast<uint8_t>(theme_color_idx & 7);
+    }
+
+    void DrawExpression(Emotion emotion, DeviceState state, uint8_t eye_color) {
+        float breath = 0.90f + 0.10f * sinf(time_s_ * 2.3f);
+        float open_ratio = 1.0f;
+        if (blink_phase_ > 0.0f) {
+            float t = blink_phase_ <= 1.0f ? blink_phase_ : (2.0f - blink_phase_);
+            open_ratio = 1.0f - 0.92f * t;
+        }
+
+        float shake_x = 0.0f;
+        float bounce_y = 0.0f;
+        if (emotion == kSurprised || emotion == kAngry) {
+            shake_x = sinf(time_s_ * 34.0f) * 0.6f;
+        }
+        if (state == kDeviceStateSpeaking) {
+            bounce_y = -fabsf(sinf(time_s_ * 7.5f)) * 0.9f;
+        } else if (emotion == kHappy) {
+            bounce_y = -fabsf(sinf(time_s_ * 5.0f)) * 1.0f;
+        }
+
+        // 40x40 网格对称中心 X = 19.5
+        const float lx = 11.5f + gaze_x_ + shake_x;
+        const float rx = 27.5f + gaze_x_ + shake_x;
+        const float cy = 16.5f + gaze_y_ + bounce_y;
+
+        switch (emotion) {
+            case kHappy:
+                DrawHappyArcEye(lx, cy + 1.0f, 4.5f, 3.6f, 1.15f, eye_color, 1.0f);
+                DrawHappyArcEye(rx, cy + 1.0f, 4.5f, 3.6f, 1.15f, eye_color, 1.0f);
+                DrawSoftOval(6.2f  + gaze_x_ * 0.35f, 23.5f + bounce_y * 0.5f, 2.5f, 1.4f, 2, 0.78f);
+                DrawSoftOval(32.8f + gaze_x_ * 0.35f, 23.5f + bounce_y * 0.5f, 2.5f, 1.4f, 2, 0.78f);
+                break;
+
+            case kLoving:
+                DrawHappyArcEye(lx, cy + 0.7f, 4.6f, 4.0f, 1.25f, 2, 1.0f);
+                DrawHappyArcEye(rx, cy + 0.7f, 4.6f, 4.0f, 1.25f, 2, 1.0f);
+                DrawSoftOval(6.8f,  23.8f, 2.7f, 1.6f, 2, 0.85f * breath);
+                DrawSoftOval(32.2f, 23.8f, 2.7f, 1.6f, 2, 0.85f * breath);
+                break;
+
+            case kWinking:
+                DrawStyledEye(lx, cy, 4.6f, 6.2f * open_ratio, 2.3f, -30.0f, 0.0f, eye_color, breath);
+                DrawHappyArcEye(rx, cy + 0.8f, 4.5f, 3.3f, 1.15f, eye_color, 1.0f);
+                DrawSoftOval(32.5f, 23.5f, 2.2f, 1.3f, 2, 0.7f);
+                break;
+
+            case kSurprised:
+                DrawRingEye(lx, cy - 0.4f, 5.2f, 1.9f, eye_color, 1.0f);
+                DrawRingEye(rx, cy - 0.4f, 5.2f, 1.9f, eye_color, 1.0f);
+                break;
+
+            case kThinking:
+                DrawStyledEye(lx, cy - 0.6f, 4.6f, 6.0f * open_ratio, 2.3f, -30.0f, 0.0f, eye_color, breath);
+                DrawStyledEye(rx, cy + 0.8f, 4.1f, 3.8f * open_ratio, 1.8f, -30.0f, 0.0f, eye_color, breath);
+                break;
+
+            case kCool:
+                DrawStyledEye(lx, cy + 0.4f, 5.2f, 4.2f * open_ratio, 1.7f, -1.8f,  0.16f, eye_color, 1.0f);
+                DrawStyledEye(rx, cy + 0.4f, 5.2f, 4.2f * open_ratio, 1.7f, -1.8f, -0.16f, eye_color, 1.0f);
+                break;
+
+            case kAngry:
+                DrawStyledEye(lx, cy, 4.8f, 5.4f * open_ratio, 1.8f, -1.5f,  0.52f, eye_color, 1.0f);
+                DrawStyledEye(rx, cy, 4.8f, 5.4f * open_ratio, 1.8f, -1.5f, -0.52f, eye_color, 1.0f);
+                break;
+
+            case kSad: {
+                DrawStyledEye(lx, cy + 0.8f, 4.6f, 5.1f * open_ratio, 2.0f, -1.3f, -0.45f, eye_color, 0.9f);
+                DrawStyledEye(rx, cy + 0.8f, 4.6f, 5.1f * open_ratio, 2.0f, -1.3f,  0.45f, eye_color, 0.9f);
+                float tear_y = 22.8f + fmodf(time_s_ * 4.2f, 6.0f);
+                DrawSoftOval(lx - 1.6f, tear_y, 1.0f, 1.3f, 0, 0.85f);
+                break;
+            }
+
+            case kSleepy:
+                DrawStyledEye(lx, cy + 1.8f, 4.8f, 1.4f, 0.9f, -30.0f, 0.0f, 6, 0.55f + 0.25f * sinf(time_s_ * 1.4f));
+                DrawStyledEye(rx, cy + 1.8f, 4.8f, 1.4f, 0.9f, -30.0f, 0.0f, 6, 0.55f + 0.25f * sinf(time_s_ * 1.4f));
+                break;
+
+            case kNeutral:
+            default: {
+                float hh = (state == kDeviceStateListening) ? 6.8f : 6.0f;
+                float hw = (state == kDeviceStateListening) ? 4.9f : 4.5f;
+                DrawStyledEye(lx, cy, hw, hh * open_ratio, 2.3f, -30.0f, 0.0f, eye_color, breath);
+                DrawStyledEye(rx, cy, hw, hh * open_ratio, 2.3f, -30.0f, 0.0f, eye_color, breath);
+                break;
+            }
+        }
+    }
+
+    // 底部嘴型与语音/连接状态 LED 动效（第 28~36 行）
+    void DrawStateOverlay(Emotion emotion, DeviceState state, uint8_t eye_color) {
+        if (state == kDeviceStateSpeaking) {
+            for (int i = -4; i <= 4; ++i) {
+                float env = 1.0f - fabsf(static_cast<float>(i)) * 0.16f;
+                float wave = 0.5f + 0.5f * sinf(time_s_ * 14.0f + i * 0.95f) * cosf(time_s_ * 5.5f - i * 0.4f);
+                int half_h = static_cast<int>(0.8f + env * wave * 2.8f);
+                int x = 20 + i * 2;
+                for (int dy = -half_h; dy <= half_h; ++dy) {
+                    PlotCell(x, 32 + dy, eye_color, 0.95f);
+                }
+            }
+        } else if (state == kDeviceStateListening) {
+            for (int i = -3; i <= 3; ++i) {
+                float wave = 0.35f + 0.65f * (0.5f + 0.5f * sinf(time_s_ * 8.0f + i * 0.85f));
+                int h = static_cast<int>(1.0f + wave * 2.6f);
+                int x = 20 + i * 3;
+                for (int k = 0; k < h; ++k) {
+                    PlotCell(x, 35 - k, 3, 0.92f);
+                }
+            }
+        } else if (state == kDeviceStateConnecting) {
+            int active_dot = static_cast<int>(time_s_ * 5.5f) % 5;
+            for (int i = 0; i < 5; ++i) {
+                float lvl = (i == active_dot) ? 1.0f : 0.25f;
+                DrawSoftOval(11.5f + i * 4.0f, 32.0f, 1.1f, 1.1f, 0, lvl);
+            }
+        } else if (emotion == kHappy || emotion == kLoving) {
+            for (int x = 16; x <= 23; ++x) {
+                float nx = (static_cast<float>(x) - 19.5f) / 3.5f;
+                float y = 30.2f - 1.5f * nx * nx;
+                PlotCell(x, static_cast<int>(y + 0.5f), 2, 0.92f);
+            }
+        } else if (emotion == kSurprised) {
+            DrawRingEye(19.5f, 30.5f, 2.3f, 1.0f, 4, 0.9f);
+        }
+    }
+
+    // 5行循环 SRAM 缓冲实现 [1 4 6 4 1]/16 可分离泛光模糊 + 活跃格剔除高速渲染至 200x200 RGB565
+    void RenderGlowFrame() {
+        static constexpr uint8_t kK[5] = {1, 4, 6, 4, 1};
+
+        for (int r = 0; r < kRows + 2; ++r) {
+            if (r < kRows) {
+                const uint8_t* row_in = grid_ + r * kCols;
+                uint16_t* row_dst = row_ring_[r % 5];
+                for (int c = 0; c < kCols; ++c) {
+                    uint16_t sr = 0, sg = 0, sb = 0;
+                    for (int k = -2; k <= 2; ++k) {
+                        int cc = c + k;
+                        if (cc < 0 || cc >= kCols) continue;
+                        uint8_t v = row_in[cc];
+                        if (v == 0) continue;
+                        uint8_t w = kK[k + 2];
+                        sr += w * color_lut_[v][0];
+                        sg += w * color_lut_[v][1];
+                        sb += w * color_lut_[v][2];
+                    }
+                    row_dst[c * 3 + 0] = sr;
+                    row_dst[c * 3 + 1] = sg;
+                    row_dst[c * 3 + 2] = sb;
+                }
+            }
+            const int out_r = r - 2;
+            if (out_r < 0) continue;
+            uint8_t* row_out = bloom_ + out_r * kCols * 3;
+            for (int c = 0; c < kCols; ++c) {
+                uint32_t sr = 0, sg = 0, sb = 0;
+                for (int k = -2; k <= 2; ++k) {
+                    int rr = out_r + k;
+                    if (rr < 0 || rr >= kRows) continue;
+                    const uint16_t* src = row_ring_[rr % 5] + c * 3;
+                    uint8_t w = kK[k + 2];
+                    sr += w * src[0];
+                    sg += w * src[1];
+                    sb += w * src[2];
+                }
+                row_out[c * 3 + 0] = static_cast<uint8_t>(sr >> 8);
+                row_out[c * 3 + 1] = static_cast<uint8_t>(sg >> 8);
+                row_out[c * 3 + 2] = static_cast<uint8_t>(sb >> 8);
+            }
+        }
+
+        // 逐灯珠合成 5x5 像素块写入 200x200 帧缓冲
+        for (int r = 0; r < kRows; ++r) {
+            const int base_y = r * kCell;
+            for (int c = 0; c < kCols; ++c) {
+                const int idx = r * kCols + c;
+                const uint8_t val = grid_[idx];
+                const uint8_t br = bloom_[idx * 3 + 0];
+                const uint8_t bg = bloom_[idx * 3 + 1];
+                const uint8_t bb = bloom_[idx * 3 + 2];
+                const int base_x = c * kCell;
+
+                if (val == 0 && (br | bg | bb) < 3) {
+                    for (int sy = 0; sy < kCell; ++sy) {
+                        uint16_t* dst = fb_ + (base_y + sy) * kWidth + base_x;
+                        memcpy(dst, unlit_tile_[sy], kCell * sizeof(uint16_t));
+                    }
+                    continue;
+                }
+
+                const uint8_t lr = color_lut_[val][0];
+                const uint8_t lg = color_lut_[val][1];
+                const uint8_t lb = color_lut_[val][2];
+                const uint16_t hot_gain = hot_lut_[val];
+                const uint16_t dark_gain = 255 - bright_lut_[val];
+
+                for (int sy = 0; sy < kCell; ++sy) {
+                    uint16_t* dst = fb_ + (base_y + sy) * kWidth + base_x;
+                    for (int sx = 0; sx < kCell; ++sx) {
+                        const uint16_t dw = dot_w_[sy][sx];
+                        const uint16_t hw = halo_w_[sy][sx];
+                        const uint16_t cw = static_cast<uint16_t>((core_w_[sy][sx] * hot_gain) >> 8);
+                        const uint16_t uw = static_cast<uint16_t>((unlit_w_[sy][sx] * dark_gain) >> 8);
+
+                        uint32_t pr = ((lr * dw) >> 8) + ((255 * cw) >> 8) + ((br * hw) >> 8) + ((18 * uw) >> 8) + 4;
+                        uint32_t pg = ((lg * dw) >> 8) + ((250 * cw) >> 8) + ((bg * hw) >> 8) + ((20 * uw) >> 8) + 5;
+                        uint32_t pb = ((lb * dw) >> 8) + ((240 * cw) >> 8) + ((bb * hw) >> 8) + ((24 * uw) >> 8) + 7;
+
+                        if (pr > 255) pr = 255;
+                        if (pg > 255) pg = 255;
+                        if (pb > 255) pb = 255;
+                        dst[sx] = PackRgb565(static_cast<uint8_t>(pr), static_cast<uint8_t>(pg), static_cast<uint8_t>(pb));
+                    }
+                }
+            }
+        }
+    }
+
+    uint16_t* fb_ = nullptr;
+    uint8_t*  bloom_ = nullptr;
+    uint8_t   grid_[kCells];
+    uint16_t  row_ring_[5][kCols * 3];  // 1.2KB 内部 SRAM 循环行缓存
+
+    uint8_t  color_lut_[256][3];
+    uint8_t  bright_lut_[256];
+    uint16_t hot_lut_[256];
+    uint16_t dot_w_[kCell][kCell];
+    uint16_t core_w_[kCell][kCell];
+    uint16_t unlit_w_[kCell][kCell];
+    uint16_t halo_w_[kCell][kCell];
+    uint16_t unlit_tile_[kCell][kCell];
+
+    float time_s_ = 0.0f;
+    float blink_phase_ = 0.0f;
+    float next_blink_t_ = 2.5f;
+    float next_saccade_t_ = 2.0f;
+    float gaze_x_ = 0.0f;
+    float gaze_y_ = 0.0f;
+    float target_gaze_x_ = 0.0f;
+    float target_gaze_y_ = 0.0f;
+};
+
+}  // namespace matrix_face
+
+// 继承 SpiLcdDisplay，居中挂载 200x200 发光点阵画布，保留顶部状态栏与底部字幕
+class GlowMatrixLcdDisplay : public SpiLcdDisplay {
+public:
+    GlowMatrixLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
+                         int width, int height, int offset_x, int offset_y,
+                         bool mirror_x, bool mirror_y, bool swap_xy)
+        : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
+        if (!engine_.Init()) {
+            return;
+        }
+        memset(&img_dsc_, 0, sizeof(img_dsc_));
+#if LVGL_VERSION_MAJOR >= 9
+        img_dsc_.header.magic  = LV_IMAGE_HEADER_MAGIC;
+        img_dsc_.header.cf     = LV_COLOR_FORMAT_RGB565;
+        img_dsc_.header.flags  = 0;
+        img_dsc_.header.w      = matrix_face::DotMatrixEngine::kWidth;
+        img_dsc_.header.h      = matrix_face::DotMatrixEngine::kHeight;
+        img_dsc_.header.stride = matrix_face::DotMatrixEngine::kWidth * sizeof(uint16_t);
+        img_dsc_.data_size     = matrix_face::DotMatrixEngine::kWidth *
+                                 matrix_face::DotMatrixEngine::kHeight * sizeof(uint16_t);
+        img_dsc_.data          = reinterpret_cast<const uint8_t*>(engine_.Framebuffer());
+
+        DisplayLockGuard lock(this);
+        face_img_ = lv_image_create(lv_screen_active());
+        lv_image_set_src(face_img_, &img_dsc_);
+        lv_obj_set_size(face_img_, matrix_face::DotMatrixEngine::kWidth,
+                        matrix_face::DotMatrixEngine::kHeight);
+        lv_obj_align(face_img_, LV_ALIGN_CENTER, 0, MATRIX_OFFSET_Y);
+        lv_obj_set_style_radius(face_img_, MATRIX_CORNER_RADIUS, 0);
+        lv_obj_set_style_clip_corner(face_img_, true, 0);
+        lv_obj_add_flag(face_img_, LV_OBJ_FLAG_HIDDEN);  // 开机配网阶段默认先隐藏
+        last_tick_us_ = esp_timer_get_time();
+        anim_timer_ = lv_timer_create(OnAnimTimer, 66, this);  // ~15 FPS，省总线保语音流畅
+#endif
+    }
+
+    ~GlowMatrixLcdDisplay() override {
+        if (anim_timer_) {
+            DisplayLockGuard lock(this);
+            lv_timer_delete(anim_timer_);
+            anim_timer_ = nullptr;
+        }
+    }
+
+    void SetEmotion(const char* emotion) override {
+        SpiLcdDisplay::SetEmotion(emotion);
+        if (!emotion) return;
+
+        matrix_face::Emotion mapped = matrix_face::kNeutral;
+        if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "laughing") == 0 || strcmp(emotion, "funny") == 0) {
+            mapped = matrix_face::kHappy;
+        } else if (strcmp(emotion, "loving") == 0 || strcmp(emotion, "kissy") == 0) {
+            mapped = matrix_face::kLoving;
+        } else if (strcmp(emotion, "winking") == 0) {
+            mapped = matrix_face::kWinking;
+        } else if (strcmp(emotion, "surprised") == 0 || strcmp(emotion, "shocked") == 0) {
+            mapped = matrix_face::kSurprised;
+        } else if (strcmp(emotion, "thinking") == 0 || strcmp(emotion, "confused") == 0) {
+            mapped = matrix_face::kThinking;
+        } else if (strcmp(emotion, "cool") == 0 || strcmp(emotion, "confident") == 0) {
+            mapped = matrix_face::kCool;
+        } else if (strcmp(emotion, "sad") == 0 || strcmp(emotion, "crying") == 0) {
+            mapped = matrix_face::kSad;
+        } else if (strcmp(emotion, "angry") == 0 || strcmp(emotion, "embarrassed") == 0) {
+            mapped = matrix_face::kAngry;
+        } else if (strcmp(emotion, "sleepy") == 0) {
+            mapped = matrix_face::kSleepy;
+        }
+        current_emotion_.store(static_cast<int>(mapped));
+    }
+
+    void SetGazeHint(float gaze_x) {
+        gaze_hint_milli_.store(static_cast<int>(gaze_x * 1000.0f));
+    }
+
+    void SetMatrixEnabled(bool enabled) {
+        enabled_.store(enabled);
+    }
+
+    void SetThemeColor(int color_idx) {
+        theme_color_.store(color_idx & 7);
+    }
+
+private:
+    static void OnAnimTimer(lv_timer_t* timer) {
+        auto* self = static_cast<GlowMatrixLcdDisplay*>(lv_timer_get_user_data(timer));
+        if (self) self->UpdateFrame();
+    }
+
+    void UpdateFrame() {
+#if LVGL_VERSION_MAJOR >= 9
+        if (!face_img_) return;
+
+        DeviceState state = Application::GetInstance().GetDeviceState();
+        // 仅在待机、聆听、说话、连接态显示点阵表情；开机/配网/激活码/OTA 升级自动隐藏不遮挡
+        bool should_show = enabled_.load() && (
+            state == kDeviceStateIdle ||
+            state == kDeviceStateListening ||
+            state == kDeviceStateSpeaking ||
+            state == kDeviceStateConnecting
+        );
+
+        if (!should_show) {
+            if (is_visible_) {
+                lv_obj_add_flag(face_img_, LV_OBJ_FLAG_HIDDEN);
+                is_visible_ = false;
+            }
+            last_tick_us_ = esp_timer_get_time();
+            return;
+        }
+
+        if (!is_visible_) {
+            lv_obj_remove_flag(face_img_, LV_OBJ_FLAG_HIDDEN);
+            is_visible_ = true;
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        float dt = static_cast<float>(now_us - last_tick_us_) * 1e-6f;
+        last_tick_us_ = now_us;
+
+        auto emo = static_cast<matrix_face::Emotion>(current_emotion_.load());
+        float gaze_hint = static_cast<float>(gaze_hint_milli_.load()) * 0.001f;
+        engine_.StepAndRender(dt, emo, state, gaze_hint, theme_color_.load());
+        lv_obj_invalidate(face_img_);
+#endif
+    }
+
+    matrix_face::DotMatrixEngine engine_;
+#if LVGL_VERSION_MAJOR >= 9
+    lv_image_dsc_t img_dsc_;
+#endif
+    lv_obj_t*   face_img_ = nullptr;
+    lv_timer_t* anim_timer_ = nullptr;
+    int64_t     last_tick_us_ = 0;
+    bool        is_visible_ = false;
+
+    std::atomic<int>  current_emotion_{static_cast<int>(matrix_face::kNeutral)};
+    std::atomic<int>  gaze_hint_milli_{0};
+    std::atomic<bool> enabled_{true};
+    std::atomic<int>  theme_color_{0};
+};
+
+static GlowMatrixLcdDisplay* g_matrix_display = nullptr;
 
 // ==================== 4舵机错峰 + 5/6号双齿轮履带【同步驱动】+ 头部三路传感器模块 ====================
 // 6台舵机引脚（对应扩展板背面 14 / 13 / 12 / 11 / 10 / 9 焊点）
@@ -136,7 +857,6 @@ static void StaggeredServoTask(void* arg) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_MS));
 
-        // 如果系统正在启动或处于配网模式（非 Idle 待机状态），直接休眠等待，让出全部 CPU 给配网网页
         if (Application::GetInstance().GetDeviceState() == kDeviceStateStarting ||
             Application::GetInstance().GetDeviceState() == kDeviceStateWifiConfiguring) {
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -223,6 +943,15 @@ static void StaggeredServoTask(void* arg) {
                     SetServoTargetSafe(i, 90);
                 }
                 SetGearTrackSync(0, 0);
+                if (g_matrix_display) {
+                    g_matrix_display->SetGazeHint(0.0f);
+                }
+                Application::GetInstance().Schedule([]() {
+                    auto display = Board::GetInstance().GetDisplay();
+                    if (display) {
+                        display->SetEmotion("neutral");
+                    }
+                });
             }
         } else {
             bool touch_active = (gpio_get_level(SENSOR_TOUCH_GPIO) == 1);
@@ -236,6 +965,7 @@ static void StaggeredServoTask(void* arg) {
                 SetServoTargetSafe(3, 35);
                 SetGearTrackSync(50, 0);
                 auto_reset_ticks = 75;
+                if (g_matrix_display) g_matrix_display->SetGazeHint(0.0f);
 
                 Application::GetInstance().Schedule([]() {
                     auto& app = Application::GetInstance();
@@ -252,6 +982,7 @@ static void StaggeredServoTask(void* arg) {
                 SetServoTargetSafe(0, 90);
                 SetGearTrackSync(-45, 0);
                 auto_reset_ticks = 75;
+                if (g_matrix_display) g_matrix_display->SetGazeHint(0.0f);
 
                 Application::GetInstance().Schedule([]() {
                     auto display = Board::GetInstance().GetDisplay();
@@ -264,6 +995,7 @@ static void StaggeredServoTask(void* arg) {
                 SetServoTargetSafe(0, 135);
                 SetGearTrackSync(45, 2);
                 auto_reset_ticks = 75;
+                if (g_matrix_display) g_matrix_display->SetGazeHint(-3.2f);
 
                 Application::GetInstance().Schedule([]() {
                     auto display = Board::GetInstance().GetDisplay();
@@ -276,6 +1008,7 @@ static void StaggeredServoTask(void* arg) {
                 SetServoTargetSafe(0, 45);
                 SetGearTrackSync(45, 1);
                 auto_reset_ticks = 75;
+                if (g_matrix_display) g_matrix_display->SetGazeHint(3.2f);
 
                 Application::GetInstance().Schedule([]() {
                     auto display = Board::GetInstance().GetDisplay();
@@ -342,6 +1075,21 @@ static void InitStaggeredServosAndSensors() {
             SetServoTargetSafe(3, properties["right_hand"].value<int>());
             int sync_val = properties["gear_sync"].value<int>();
             SetGearTrackSync(sync_val - 90, 0);
+            return true;
+        });
+
+    McpServer::GetInstance().AddTool("self.face.set_mode",
+        "控制200x200居中发光点阵表情屏开关与待机配色。enabled(1=开启点阵表情, 0=显示原生界面)；"
+        "color_theme(0=青蓝, 1=暖白, 2=樱花粉, 3=薄荷绿, 4=琥珀金, 5=珊瑚红, 6=柔紫, 7=冰蓝)。",
+        PropertyList({
+            Property("enabled", kPropertyTypeInteger, 1, 0, 1),
+            Property("color_theme", kPropertyTypeInteger, 0, 0, 7)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            if (g_matrix_display) {
+                g_matrix_display->SetMatrixEnabled(properties["enabled"].value<int>() != 0);
+                g_matrix_display->SetThemeColor(properties["color_theme"].value<int>());
+            }
             return true;
         });
 
@@ -444,8 +1192,12 @@ private:
 #ifdef LCD_TYPE_GC9A01_SERIAL
         panel_config.vendor_config = &gc9107_vendor_config;
 #endif
-        display_ = new SpiLcdDisplay(panel_io, panel,
-                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        auto* matrix_disp = new GlowMatrixLcdDisplay(
+            panel_io, panel,
+            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
+            DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        g_matrix_display = matrix_disp;
+        display_ = matrix_disp;
     }
 
     void InitializeButtons() {
